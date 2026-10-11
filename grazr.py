@@ -492,8 +492,10 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
         accounts.record_snapshot(paths, active, limits)
         # A parked account is the one grazr chose to leave, so what its window
         # had left when it ran out is the number that says whether leaving was
-        # right. Nobody reads for it, so its record is checked here instead.
-        for parked in enrolled:
+        # right. Nobody reads for it, so its record is checked here instead,
+        # read again under the lock: the copy loaded above may predate a pane
+        # that logged the same leftover a moment ago.
+        for parked in accounts.load(paths, []):
             if parked.id == active or not isinstance(parked.snapshot, list):
                 continue
             expired = core.replaced(parked.snapshot, [], now)

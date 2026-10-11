@@ -4,6 +4,14 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- A parked account's leftover was logged once per pane when several panes
+  reported in the same second. The parked record is now read again under
+  the readings lock.
+
 ## 0.5.0 - 2026-10-07
 
 ### Added

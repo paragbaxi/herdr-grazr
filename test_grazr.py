@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -2846,6 +2847,34 @@ class StatuslineTest(EnrolledPairFixture):
 
         for _ in range(2):
             self.run_statusline(self.payload(used=10, resets_at=int((now + timedelta(hours=4)).timestamp())))
+
+        with open(os.path.join(self.state_dir, "grazr.log")) as handle:
+            logged = handle.read()
+        self.assertEqual(logged.count("personal session window reset with 4% left"), 1, logged)
+
+    def test_two_panes_reporting_at_once_log_a_parked_leftover_once(self):
+        """Every pane loads the accounts before it queues for the readings
+        lock. The pane that loses the race must look at the parked account
+        again inside the lock, or it logs what the winner already logged."""
+        now = datetime.now(timezone.utc)
+        self.write_account_snapshot("uuid-personal", 4, now - timedelta(minutes=1))
+        payload = self.payload(used=10, resets_at=int((now + timedelta(hours=4)).timestamp()))
+        loaded = threading.Event()
+        real_load = accounts.load
+
+        def load_then_signal(*args):
+            result = real_load(*args)
+            loaded.set()
+            return result
+
+        with mock.patch.object(accounts, "load", load_then_signal):
+            with grazr._file_lock(os.path.join(self.state_dir, "readings.lock"), wait=True):
+                loser = threading.Thread(target=self.run_statusline, args=(payload,))
+                loser.start()
+                self.assertTrue(loaded.wait(5))
+                grazr._log(self.state_dir, now, "personal session window reset with 4% left")
+                accounts.record_snapshot(self.runtime().paths, "uuid-personal", [])
+            loser.join(5)
 
         with open(os.path.join(self.state_dir, "grazr.log")) as handle:
             logged = handle.read()
