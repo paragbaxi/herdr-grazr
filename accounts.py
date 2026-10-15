@@ -20,7 +20,10 @@ def parse_time(value):
     if not value:
         return None
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    # A record from before the rounding can carry a fraction of a second, and
+    # a reading of the same window has to match it.
+    return datetime.fromtimestamp(round(parsed.timestamp() / 60) * 60, timezone.utc)
 
 
 def account_id(value):

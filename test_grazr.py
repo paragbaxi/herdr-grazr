@@ -1418,6 +1418,18 @@ class AccountLoadTest(unittest.TestCase):
 
         self.assertEqual([entry.name for entry in accounts.load(self.paths, [])], ["work"])
 
+    def test_a_stored_reset_time_is_rounded_to_the_minute(self):
+        """A record from before the rounding can carry a fraction of a second,
+        and a reading of the same window must match it. Issue 7."""
+        self.write_account("uuid-work", {"name": "work", "snapshot": [{
+            "kind": "weekly_all", "scope": None, "group": "weekly", "remaining": 80,
+            "resets_at": "2026-10-18T20:00:00.978278+00:00",
+        }]})
+
+        [work] = accounts.load(self.paths, [])
+
+        self.assertEqual(work.snapshot[0].resets_at, datetime(2026, 10, 18, 20, tzinfo=timezone.utc))
+
     def test_a_snapshot_with_values_of_the_wrong_type_reads_as_never_parked(self):
         for snapshot in (
             [{"kind": "session", "scope": None, "group": "session", "remaining": "12", "resets_at": None}],
@@ -2461,7 +2473,7 @@ class SwapTest(EnrolledPairFixture):
     def test_nowhere_to_go_names_the_window_that_holds_it(self):
         """The refusal is on screen under the user's finger, so it carries the
         same answer the automatic line does: which window, and until when."""
-        reset = datetime.now(timezone.utc) + timedelta(hours=3)
+        reset = (datetime.now(timezone.utc) + timedelta(hours=3)).replace(second=0, microsecond=0)
         self.write_account_snapshot("uuid-personal", remaining=0, resets_at=reset)
 
         code, printed = self.invoke(grazr.swap)
@@ -2497,7 +2509,7 @@ class SwapTest(EnrolledPairFixture):
         self.assertIn("not swapping now", self.notices[0][1])
 
     def test_nowhere_to_go_names_the_earliest_reset(self):
-        spent_until = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(microsecond=0)
+        spent_until = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(second=0, microsecond=0)
         with open(os.path.join(self.state_dir, "accounts", "uuid-personal.json"), "w") as f:
             json.dump(
                 {
@@ -2557,7 +2569,7 @@ class SwapTest(EnrolledPairFixture):
         """Moving there would last one message: the automatic path moves off a
         spent account at the next reading. Two swaps for nothing, so the named
         swap refuses as the key does, and says when the account frees up."""
-        reset = datetime.now(timezone.utc) + timedelta(hours=2)
+        reset = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(second=0, microsecond=0)
         self.write_account_snapshot("uuid-personal", remaining=0, resets_at=reset)
 
         code, printed = self.swap_to("personal")
@@ -3288,6 +3300,18 @@ class StatuslinePayloadTest(unittest.TestCase):
         )
 
         self.assertEqual([(entry.group, entry.resets_at) for entry in limits], [("weekly", None)])
+
+    def test_a_reset_time_is_rounded_to_the_minute(self):
+        """Some builds of Claude send the reset with a fraction of a second
+        that drifts between payloads. A window is told by its reset time, so
+        two readings of one window must land on the same time. Issue 7."""
+        noon = datetime(2026, 10, 20, 12, tzinfo=timezone.utc)
+        limits = claude.statusline_limits(self.payload(
+            five_hour={"used_percentage": 10, "resets_at": noon.timestamp() - 0.03},
+            seven_day={"used_percentage": 10, "resets_at": noon.timestamp() + 0.978278},
+        ))
+
+        self.assertEqual([entry.resets_at for entry in limits], [noon, noon])
 
     def test_a_payload_without_limits_is_none(self):
         self.assertIsNone(claude.statusline_limits(json.dumps({"session_id": "s"})))

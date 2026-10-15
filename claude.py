@@ -126,7 +126,9 @@ def statusline_limits(payload):
 def _from_unix(seconds):
     if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
         return None
-    return datetime.fromtimestamp(seconds, timezone.utc)
+    # Some builds send a fraction that drifts between payloads, and a window
+    # is told by its reset time.
+    return datetime.fromtimestamp(round(seconds / 60) * 60, timezone.utc)
 
 
 def active_account(paths):
