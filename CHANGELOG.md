@@ -11,6 +11,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A parked account's leftover was logged once per pane when several panes
   reported in the same second. The parked record is now read again under
   the readings lock.
+- Some builds of Claude send a reset time with a fraction of a second that
+  drifts between payloads. A reading from a pane still on the old account
+  then slipped past the left-behind guard, was logged as a weekly reset and
+  made the handover rule swap two healthy accounts back and forth. Reset
+  times are now rounded to the minute, on reading and on loading a record,
+  and a week has to end at least an hour sooner to be worth a handover.
+  Issue 7.
 
 ## 0.5.0 - 2026-10-07
 

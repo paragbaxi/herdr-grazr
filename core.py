@@ -14,6 +14,10 @@ FRESH = 95
 # How long before its reset an account's leftover is worth going back for.
 LAST_DAY_SECONDS = 24 * 60 * 60
 
+# A handover is only worth it when the other week ends at least this much
+# sooner.
+SOONER_BY_SECONDS = 60 * 60
+
 
 def merged(previous, current, now):
     """A window already on record keeps the lowest headroom it has shown. Idle
@@ -130,7 +134,9 @@ def expiring_sooner(limits, active, accounts, now, thresholds):
         if not _has_headroom(candidate.snapshot, now, thresholds):
             continue
         for limit in candidate.snapshot:
-            if limit.group != "weekly" or not limit.resets_at or not now < limit.resets_at < ends:
+            if limit.group != "weekly" or not limit.resets_at or not now < limit.resets_at:
+                continue
+            if (ends - limit.resets_at).total_seconds() < SOONER_BY_SECONDS:
                 continue
             worth_it = limit.remaining >= thresholds.get("weekly", 0) + FALLBACK_MARGIN
             last_day = (limit.resets_at - now).total_seconds() <= LAST_DAY_SECONDS

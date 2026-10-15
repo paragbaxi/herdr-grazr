@@ -224,6 +224,15 @@ class ExpiringSoonerTest(unittest.TestCase):
             "stay",
         )
 
+    def test_a_week_ending_minutes_sooner_is_not_worth_a_handover(self):
+        """Two readings of one window can differ by a fraction, and two
+        accounts' weeks can end at nearly the same time. Neither is worth two
+        swaps. Issue 7."""
+        self.assertEqual(
+            decide(self.fresh_week(), "work", [self.ending_in(7 - 30 / 1440)], now=NOW, thresholds=THRESHOLDS),
+            "stay",
+        )
+
     def test_an_account_below_its_threshold_is_not_worth_it(self):
         self.assertEqual(
             decide(self.fresh_week(), "work", [self.ending_in(2, remaining=5)], now=NOW, thresholds=THRESHOLDS),
