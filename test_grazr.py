@@ -3058,11 +3058,9 @@ class StatuslineTest(EnrolledPairFixture):
     def test_a_payload_without_limits_is_reported_once(self):
         """A Claude release that renames the field would otherwise leave grazr
         blind in silence, until the next pane hits the wall."""
-        spoken = {"session_id": "s", "version": "9.9.9",
-                  "context_window": {"total_input_tokens": 512}}
-
-        self.run_statusline(json.dumps(spoken))
-        self.run_statusline(json.dumps(spoken))
+        for tokens in (512, 1024, 2048):
+            self.run_statusline(json.dumps({"session_id": "s", "version": "9.9.9",
+                                            "context_window": {"total_input_tokens": tokens}}))
 
         self.assertEqual(len(self.notices), 1)
         self.assertEqual(self.notices[0][0], "grazr: cannot read Claude's usage")
@@ -3130,12 +3128,11 @@ class StatuslineTest(EnrolledPairFixture):
 
     def test_one_session_missing_twice_still_warns(self):
         """A session that completes two turns and never once gets usage is the
-        renamed-field case the warning exists for."""
-        blind = json.dumps({"session_id": "a", "version": "9.9.9",
-                            "context_window": {"total_input_tokens": 512}})
-
-        self.run_statusline(blind)
-        self.run_statusline(blind)
+        renamed-field case the warning exists for. The second turn shows in
+        the token count."""
+        for tokens in (512, 1024):
+            self.run_statusline(json.dumps({"session_id": "a", "version": "9.9.9",
+                                            "context_window": {"total_input_tokens": tokens}}))
 
         self.assertEqual(len(self.notices), 1)
         self.assertEqual(self.notices[0][0], "grazr: cannot read Claude's usage")
@@ -3143,7 +3140,7 @@ class StatuslineTest(EnrolledPairFixture):
     def test_the_old_version_list_on_disk_is_read_as_empty(self):
         """0.3.3 stored a list of versions here. The session-keyed dict starts
         fresh rather than choking on the old shape."""
-        with open(os.path.join(self.state_dir, "unreadable_pending.json"), "w") as handle:
+        with open(os.path.join(self.state_dir, "statusline.unreadable.json"), "w") as handle:
             json.dump(["9.9.9"], handle)
         blind = json.dumps({"session_id": "a", "version": "9.9.9",
                             "context_window": {"total_input_tokens": 512}})
@@ -3156,15 +3153,30 @@ class StatuslineTest(EnrolledPairFixture):
         """An idle pane that sends no limits re-runs the status line every
         minute, so a rotation that wiped its record brought the toast back
         seconds after every swap."""
-        spoken = json.dumps({"session_id": "s", "version": "9.9.9",
-                             "context_window": {"total_input_tokens": 512}})
+        def spoken(tokens):
+            return json.dumps({"session_id": "s", "version": "9.9.9",
+                               "context_window": {"total_input_tokens": tokens}})
 
-        self.run_statusline(spoken)
+        self.run_statusline(spoken(512))
+        self.run_statusline(spoken(1024))
         self.invoke(grazr.swap)
-        self.run_statusline(spoken)
+        self.run_statusline(spoken(2048))
 
         titles = [title for title, _ in self.notices]
         self.assertEqual(titles.count("grazr: cannot read Claude's usage"), 1)
+
+    def test_a_resumed_session_repeating_its_payload_while_idle_never_warns(self):
+        """A resumed session has tokens from its transcript but no limits until
+        its first new request, and the idle refresh sends the same payload
+        again and again. Only a payload with more tokens than the last miss
+        shows a turn that came back without limits."""
+        resumed = json.dumps({"session_id": "s", "version": "9.9.9",
+                              "context_window": {"total_input_tokens": 512}})
+
+        for _ in range(5):
+            self.run_statusline(resumed)
+
+        self.assertEqual(self.notices, [])
 
     def test_a_session_that_has_not_reached_the_api_yet_is_not_a_problem(self):
         fresh = {"session_id": "s", "version": "9.9.9",

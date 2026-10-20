@@ -552,27 +552,29 @@ def _report_signed_out(state_dir):
 def _warn_unreadable(state_dir, payload):
     """A renamed field would leave grazr blind, so a completed turn with no
     limits is worth a warning (a turn that never reached the API has none to
-    send). The block is also missing for a turn after a resume or reset, so the
-    first miss in a session only arms it: a reading with limits disarms that
-    session, and only a session that misses twice trips the warning, announced
+    send). The block is also missing after a resume or a reset, and a resumed
+    session repeats the same payload while idle. So a miss only counts when
+    the session has more tokens than at its last miss, which takes a turn: a
+    reading with limits disarms the session for good, and the warning goes out
     once per version."""
     try:
         sent = json.loads(payload)
-        spoken = sent["context_window"]["total_input_tokens"] > 0
+        tokens = sent["context_window"]["total_input_tokens"]
         session = sent.get("session_id")
         version = sent.get("version", "unknown")
     except (ValueError, KeyError, TypeError, AttributeError):
         return
-    if not spoken or not session:
+    if not isinstance(tokens, int) or tokens <= 0 or not session:
         return
     armed = _pending_unreadable(state_dir)
     # A session that has carried limits before has proven the field name. Its
     # later misses are a window that ran out before the next request, which is
     # what every payload looks like right after a weekly reset.
-    if armed.get(session) == PROVEN:
+    last = armed.get(session)
+    if last == PROVEN:
         return
-    if session not in armed:
-        armed[session] = version
+    if not isinstance(last, int) or tokens <= last:
+        armed[session] = tokens
         if len(armed) > UNREADABLE_PENDING_CAP:
             armed.pop(next(iter(armed)))
         _write_pending_unreadable(state_dir, armed)
@@ -600,9 +602,10 @@ def _disarm_unreadable(state_dir, payload):
 
 
 def _pending_unreadable(state_dir):
-    """Sessions that have missed once, mapped to their Claude version, and
-    sessions that have carried limits, mapped to PROVEN. The old list format
-    is read as empty, so the upgrade starts fresh."""
+    """Sessions that have missed, mapped to their token count at the last
+    miss, and sessions that have carried limits, mapped to PROVEN. A version
+    string from before the token count, or the old list format, starts that
+    entry over."""
     try:
         with open(os.path.join(state_dir, UNREADABLE_PENDING)) as handle:
             armed = json.load(handle)

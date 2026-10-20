@@ -4,6 +4,15 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- "Claude X sends no rate limits" fired once per Claude version, from a
+  resumed session that repeated its payload while idle. A miss now counts
+  only when the session has more tokens than at its last miss, which takes
+  a turn.
+
 ## 0.5.1 - 2026-10-15
 
 ### Fixed
