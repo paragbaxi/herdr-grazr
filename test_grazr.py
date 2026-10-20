@@ -2932,7 +2932,7 @@ class StatuslineTest(EnrolledPairFixture):
     def test_two_accounts_sharing_a_reset_time_still_rotate(self):
         """Reset times fall on ten-minute marks, so two accounts can share one.
         That alone must not make a reading look like the other account's."""
-        shared = datetime.now(timezone.utc) + timedelta(hours=3)
+        shared = (datetime.now(timezone.utc) + timedelta(hours=3)).replace(second=0, microsecond=0)
         self.write_account_snapshot("uuid-personal", remaining=95, resets_at=shared)
 
         self.run_statusline(self.payload(used=99, resets_at=int(shared.timestamp())))
@@ -2943,7 +2943,7 @@ class StatuslineTest(EnrolledPairFixture):
         """A session makes its next request on the new account, but until then
         its status line still reports the one it left, under that window's
         reset time."""
-        left_window = datetime.now(timezone.utc) + timedelta(hours=3)
+        left_window = (datetime.now(timezone.utc) + timedelta(hours=3)).replace(second=0, microsecond=0)
         self.write_account_snapshot("uuid-personal", remaining=1, resets_at=left_window)
 
         self.run_statusline(self.payload(used=99, resets_at=int(left_window.timestamp())))
@@ -2974,7 +2974,7 @@ class StatuslineTest(EnrolledPairFixture):
         active account instead."""
         active_window = datetime.now(timezone.utc) + timedelta(hours=5)
         self.write_account_snapshot("uuid-work", remaining=80, resets_at=active_window)
-        left_window = datetime.now(timezone.utc) + timedelta(hours=3)
+        left_window = (datetime.now(timezone.utc) + timedelta(hours=3)).replace(second=0, microsecond=0)
         self.write_account_snapshot("uuid-personal", remaining=13, resets_at=left_window)
 
         self.run_statusline(self.payload(used=89, resets_at=int(left_window.timestamp())))
