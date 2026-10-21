@@ -11,6 +11,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The status line could end up calling itself. Connecting now leaves a bar
   of your own that calls grazr alone, and the shim never runs a saved
   previous line that calls grazr. Such a bar also counts as connected.
+- A toast Herdr did not show is tried again a minute later, not on every
+  message of every pane.
 
 ## 0.5.2 - 2026-10-20
 

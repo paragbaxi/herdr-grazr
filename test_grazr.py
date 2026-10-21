@@ -2168,18 +2168,37 @@ class ActOnDecisionTest(unittest.TestCase):
 
         self.assertIn("earliest reset", line or "")
 
-    def test_a_toast_that_never_appeared_is_retried_next_time(self):
+    def test_a_toast_that_never_appeared_is_retried_once_the_wait_is_over(self):
         """A toast suppressed as busy or disabled was never seen. Marking it
         announced would mean the user is never told at all."""
         limits = [limit(group="session", remaining=0)]
         with mock.patch.object(grazr, "notify", lambda title, body: False):
-            grazr.act_on(
-                "exhausted", self.runtime(), "uuid-work", limits
-            )
+            grazr.act_on("exhausted", self.runtime(), "uuid-work", limits, [], NOW)
 
-        self.act("exhausted", limits=limits)
+        with mock.patch.object(grazr, "NOTICE_RETRY_SECONDS", 0):
+            self.act("exhausted", limits=limits)
 
         self.assertEqual(len(self.notices), 1, "must announce again after a suppressed toast")
+
+    def test_a_store_from_before_the_wait_is_retried_right_away(self):
+        """It holds False for a toast never shown."""
+        with open(os.path.join(self.state_dir, "notices.json"), "w") as handle:
+            json.dump({"unenrolled": False}, handle)
+
+        self.act("unenrolled")
+
+        self.assertEqual(len(self.notices), 1)
+
+    def test_a_suppressed_toast_waits_a_minute_before_the_next_try(self):
+        """Each try spawns herdr. Toasts are off in Herdr by default, so a try
+        on every message of every pane is a steady cost that never pays."""
+        limits = [limit(group="session", remaining=0)]
+        tries = []
+        with mock.patch.object(grazr, "notify", lambda title, body: tries.append(title) and False):
+            for _ in range(5):
+                grazr.act_on("exhausted", self.runtime(), "uuid-work", limits)
+
+        self.assertEqual(len(tries), 1)
 
     def test_a_rotation_clears_the_situation_it_resolved(self):
         """The marker is the dedupe key as well as the status line. Leaving

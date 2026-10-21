@@ -62,6 +62,8 @@ CLOSE_KEYS = (ESCAPE, "q", "\r", "\n", "")
 
 # Telling the user is worth a moment, but not a stuck status line.
 NOTIFY_TIMEOUT_SECONDS = 5
+# A toast that did not appear is tried again, but not on every message.
+NOTICE_RETRY_SECONDS = 60
 # A rotation reports to every Claude pane, so none of them may hang.
 TAG_TIMEOUT_SECONDS = 5
 STATUSLINE_TIMEOUT_SECONDS = 5
@@ -230,7 +232,7 @@ def act_on(decision, runtime, active_id, limits, enrolled=(), now=None):
     notices = {
         key: seen for key, seen in _read_notices(state_dir).items() if key.startswith("unreadable:")
     }
-    notices[line] = shown
+    notices[line] = _tried(shown)
     _write_notices(state_dir, notices)
     return line
 
@@ -283,7 +285,9 @@ def _announce_once(state_dir, key, title, body):
 
     The plugin log is the durable record and must not depend on the toast:
     Herdr's toasts are off by default. The toast is ephemeral and Herdr drops it
-    while another is on screen, so it is retried until it is really shown.
+    while another is on screen, so it is retried until it is really shown, a
+    minute apart: each try spawns Herdr, and with toasts off every message of
+    every pane would pay for one.
 
     Returns whether this situation is new, which is what earns a log line. The
     branches that call it are reached on every message of every pane, and two
@@ -296,13 +300,24 @@ def _announce_once(state_dir, key, title, body):
             return False
         notices = _read_notices(state_dir)
         if key in notices:
-            if not notices[key] and notify(title, body):
-                notices[key] = True
+            tried = notices[key]
+            if tried is not True and _now() - (tried or 0) >= NOTICE_RETRY_SECONDS:
+                notices[key] = _tried(notify(title, body))
                 _write_notices(state_dir, notices)
             return False
-        notices[key] = notify(title, body)
+        notices[key] = _tried(notify(title, body))
         _write_notices(state_dir, notices)
         return True
+
+
+def _tried(shown):
+    """True once the toast appeared, else when it was last tried, so the next
+    try waits. Older stores hold False there, which reads as never tried."""
+    return True if shown else _now()
+
+
+def _now():
+    return datetime.now(timezone.utc).timestamp()
 
 
 def _read_notices(state_dir):
