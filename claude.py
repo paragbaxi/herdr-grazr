@@ -319,12 +319,20 @@ def install_statusline(config_dir, record_path, command):
     settings = _read_settings(config_dir)
     current = settings.get("statusLine")
     recorded = _read_record(record_path)
-    if isinstance(current, dict) and current.get("command") == command:
+    if _command(current) == command:
         return "Status line already connected"
-    # Any grazr shim counts as ours. An upgrade that died between the two writes
-    # leaves the old shim in the settings, and it is not the user's status line.
-    ours_before = recorded and _is_ours(current, recorded)
-    previous = recorded["previous"] if ours_before else current
+    if (recorded and _is_ours(current, recorded)) or _is_shim(current):
+        # Any grazr shim counts as ours. An upgrade that died between the two
+        # writes leaves the old shim in the settings, and it is not the user's
+        # status line. Without the record, what it wrapped is gone: the shim
+        # must not become its own previous line, or it would run itself.
+        previous = recorded["previous"] if recorded else None
+    elif runs_grazr(_command(current)):
+        # The user's own bar calls grazr for a segment. Wrapped, the shim would
+        # run the bar, which runs grazr, which runs the bar, on every message.
+        return "Status line already runs grazr in your own bar, left alone"
+    else:
+        previous = current
     atomic.write(record_path, json.dumps({"previous": previous, "shim": command}))
     settings["statusLine"] = {
         "type": "command",
@@ -352,20 +360,35 @@ def uninstall_statusline(config_dir, record_path):
 
 
 def statusline_installed(config_dir, record_path):
-    recorded = _read_record(record_path)
-    if recorded is None:
-        return False
+    """The recorded shim is in, or the user's own bar calls grazr. A shim from
+    another checkout is neither: it is replaced on connect, not passed."""
     try:
-        return (_read_settings(config_dir).get("statusLine") or {}).get("command") == recorded["shim"]
+        current = _read_settings(config_dir).get("statusLine")
     except RuntimeError:
         return False
+    if runs_grazr(_command(current)) and not _is_shim(current):
+        return True
+    recorded = _read_record(record_path)
+    return recorded is not None and _command(current) == recorded["shim"]
+
+
+def runs_grazr(command):
+    """The command calls grazr's status line somewhere: the shim, or a bar of
+    the user's own that calls grazr for one segment."""
+    return "grazr.py" in command and "statusline" in command
 
 
 def _is_ours(entry, recorded):
-    command = entry.get("command", "") if isinstance(entry, dict) else ""
-    return command == recorded["shim"] or (
-        "grazr.py" in command and command.rstrip().endswith("statusline")
-    )
+    return _command(entry) == recorded["shim"] or _is_shim(entry)
+
+
+def _is_shim(entry):
+    command = _command(entry)
+    return "grazr.py" in command and command.rstrip().endswith("statusline")
+
+
+def _command(entry):
+    return (entry.get("command") if isinstance(entry, dict) else None) or ""
 
 
 def _read_record(record_path):

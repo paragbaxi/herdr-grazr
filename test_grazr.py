@@ -2671,6 +2671,18 @@ class StatuslineTest(EnrolledPairFixture):
 
         self.assertEqual(printed, "inner bar")
 
+    def test_a_previous_status_line_that_calls_grazr_is_never_run(self):
+        """An older connect step saved such a bar. Run, it would call this shim
+        back on every message, without end."""
+        with open(os.path.join(self.state_dir, "statusline.previous.json"), "w") as handle:
+            json.dump({"previous": {"type": "command",
+                                    "command": "printf 'bar'; python3 /x/grazr.py statusline"},
+                       "shim": "python3 grazr.py statusline"}, handle)
+
+        _, printed = self.run_statusline(self.payload(used=10))
+
+        self.assertEqual(printed, "")
+
     def test_a_login_grazr_never_enrolled_says_once_why_it_does_not_rotate(self):
         """Its reading has no account file to go in, so the decision never sees
         it. Silence there looks like a rotation that should have happened."""
@@ -3371,6 +3383,32 @@ class StatuslineInstallTest(unittest.TestCase):
             self.assertEqual(json.load(handle), {"previous": old, "shim": "SHIM"})
         self.assertEqual(line, "Status line connected")
 
+    def test_a_bar_that_already_calls_grazr_is_left_alone(self):
+        """Wrapped, the shim would run the bar, which runs grazr, which runs
+        the bar: a chain of shells on every message until the host stalls."""
+        bar = {"type": "command",
+               "command": "printf 'x'; python3 /x/grazr.py statusline | tail -c 40"}
+        self.write_settings({"statusLine": bar})
+
+        line = claude.install_statusline(self.directory, self.record, "SHIM")
+
+        self.assertEqual(self.read_settings()["statusLine"], bar)
+        self.assertFalse(os.path.exists(self.record))
+        self.assertEqual(line, "Status line already runs grazr in your own bar, left alone")
+
+    def test_an_old_shim_without_its_record_is_not_kept_as_the_previous_line(self):
+        """With the state directory gone, the shim in the settings is still
+        grazr's. Saved as "previous", the new shim would run it, and it would
+        run itself."""
+        self.write_settings({"statusLine": {"type": "command",
+                                            "command": "python3 /old/grazr.py statusline"}})
+
+        claude.install_statusline(self.directory, self.record, "SHIM")
+
+        with open(self.record) as handle:
+            self.assertEqual(json.load(handle), {"previous": None, "shim": "SHIM"})
+        self.assertEqual(self.read_settings()["statusLine"]["command"], "SHIM")
+
     def test_a_setup_without_a_status_line_gets_one_that_refreshes_while_idle(self):
         claude.install_statusline(self.directory, self.record, "SHIM")
 
@@ -3450,6 +3488,14 @@ class StatuslineInstallTest(unittest.TestCase):
         self.assertTrue(claude.statusline_installed(self.directory, self.record))
         self.write_settings({"statusLine": {"type": "command", "command": "mine"}})
         self.assertFalse(claude.statusline_installed(self.directory, self.record))
+
+    def test_a_bar_that_calls_grazr_counts_as_connected(self):
+        """Every message reaches grazr through it, and the connect step would
+        leave it alone anyway."""
+        self.write_settings({"statusLine": {"type": "command",
+                                            "command": "printf 'x'; python3 /x/grazr.py statusline | tail -c 40"}})
+
+        self.assertTrue(claude.statusline_installed(self.directory, self.record))
 
     def test_a_settings_file_that_is_not_json_is_not_touched(self):
         with open(self.settings, "w") as handle:

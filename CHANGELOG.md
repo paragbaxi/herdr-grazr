@@ -4,6 +4,14 @@ Notable changes to *grazr*, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- The status line could end up calling itself. Connecting now leaves a bar
+  of your own that calls grazr alone, and the shim never runs a saved
+  previous line that calls grazr. Such a bar also counts as connected.
+
 ## 0.5.2 - 2026-10-20
 
 ### Fixed

@@ -678,7 +678,9 @@ def _previous_bar(state_dir, payload, spawn):
             command = (json.load(handle)["previous"] or {}).get("command")
     except (OSError, ValueError, KeyError, AttributeError):
         return ""
-    if not command:
+    # A previous line that calls grazr would call this shim back on every
+    # message, without end. An older connect step could save one.
+    if not command or claude.runs_grazr(command):
         return ""
     try:
         return spawn(
