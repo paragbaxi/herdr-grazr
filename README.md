@@ -42,6 +42,7 @@ Herdr](#without-herdr).
 [How it works](#how-it-works) ·
 [Install](#install) ·
 [Without Herdr](#without-herdr) ·
+[With Shepherdr's Autopilot](#with-shepherdrs-autopilot) ·
 [Swap on demand](#swap-on-demand) ·
 [After a swap](#after-a-swap) ·
 [What it will not do](#what-it-will-not-do) ·
@@ -249,6 +250,25 @@ puts your status line back. A `git pull` is the update.
 
 What you do without: a swap is written to `grazr.log` only, since the toast is
 Herdr's. Make the swap command a shell alias if you want a key.
+
+## With Shepherdr's Autopilot
+
+Autopilot's Mac sandbox denies the Keychain, so a sandboxed Claude cannot swap
+anything itself and its status line is not *grazr*'s. Shepherdr follows the live
+login for it, keeping a file inside the sandbox equal to whatever the Keychain
+holds, and never hands in a refresh token or a parked login. Only the readings
+need connecting:
+
+```sh
+herdr plugin action invoke wazum.grazr.connect-autopilot
+```
+
+That writes `~/.config/shepherdr/autopilot-usage`, which Shepherdr runs outside
+the sandbox with each reading. Without it *grazr* sees no usage while Autopilot
+is the only thing running, and no swap fires. `disconnect-autopilot` removes it.
+Both leave alone a command that is not *grazr*'s. A reading comes from inside
+the sandbox, so an agent could lie about it: the worst it can do is make *grazr*
+swap early, within your accounts.
 
 ## Swap on demand
 

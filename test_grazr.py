@@ -3655,6 +3655,82 @@ REAL_PAYLOAD = json.dumps({
 })
 
 
+class AutopilotReadingTest(EnrolledPairFixture):
+    """A sandboxed Claude cannot run grazr's status line, so its readings arrive
+    from outside, and rotation must fire on them alone."""
+
+    def payload(self, used):
+        return json.dumps({"rate_limits": {"five_hour": {"used_percentage": used, "resets_at": None}}})
+
+    def run_reading(self, payload):
+        return self.invoke(
+            lambda runtime: grazr.reading(runtime, payload, detach=lambda: grazr.decide(runtime))
+        )
+
+    def test_a_low_reading_rotates_with_no_status_line_running(self):
+        self.run_reading(self.payload(used=90))
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+    def test_a_healthy_reading_rotates_nothing(self):
+        self.run_reading(self.payload(used=10))
+
+        self.assertEqual(self.rotations, [])
+
+    def test_it_runs_no_bar_and_prints_nothing(self):
+        spawned = []
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.invoke(lambda runtime: grazr.statusline(runtime, self.payload(used=10), spawn=lambda *a, **k: spawned.append(a), bar=False))
+
+        self.assertEqual(spawned, [])
+        self.assertEqual(output.getvalue(), "")
+
+
+class AutopilotCommandTest(unittest.TestCase):
+    """The file Shepherdr runs with each reading. Shepherdr refuses one others
+    can write, and grazr must not take over one it did not write."""
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.path = os.path.join(self.directory, ".config", "shepherdr", "autopilot-usage")
+        patch = mock.patch.object(grazr, "_autopilot_command", lambda: self.path)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.runtime = (None, None, os.path.join(self.directory, "state dir"), None)
+
+    def test_it_writes_an_owner_only_command_that_quotes_its_paths(self):
+        self.assertEqual(grazr.connect_autopilot(self.runtime), 0)
+
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o700)
+        with open(self.path) as handle:
+            script = handle.read()
+        self.assertTrue(script.startswith("#!/bin/sh\n"))
+        self.assertIn(shlex.quote(os.path.join(self.directory, "state dir")), script)
+        self.assertTrue(script.rstrip().endswith(" reading"))
+
+    def test_connecting_twice_is_fine_and_disconnect_removes_it(self):
+        grazr.connect_autopilot(self.runtime)
+        self.assertEqual(grazr.connect_autopilot(self.runtime), 0)
+
+        self.assertEqual(grazr.disconnect_autopilot(self.runtime), 0)
+
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(grazr.disconnect_autopilot(self.runtime), 0)
+
+    def test_it_leaves_someone_elses_command_alone(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w") as handle:
+            handle.write("#!/bin/sh\nmine\n")
+
+        self.assertEqual(grazr.connect_autopilot(self.runtime), 1)
+        self.assertEqual(grazr.disconnect_autopilot(self.runtime), 1)
+
+        with open(self.path) as handle:
+            self.assertEqual(handle.read(), "#!/bin/sh\nmine\n")
+
+
 class StatuslinePayloadTest(unittest.TestCase):
     """What Claude hands its status line after every message, read into the
     limits grazr decides on."""

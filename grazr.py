@@ -64,6 +64,7 @@ RETURN_MARGIN_CEILING = 50
 LOG = "grazr.log"
 PREVIOUS_STATUSLINE = "statusline.previous.json"
 UNREADABLE_PENDING = "statusline.unreadable.json"
+AUTOPILOT_MARK = "Written by grazr's connect-autopilot action"
 # Only a live session can miss twice, so the armed set never needs to be large.
 UNREADABLE_PENDING_CAP = 64
 # No Claude version is the empty string, so it marks a session that has
@@ -525,7 +526,7 @@ def _config_path():
     return os.path.join(directory, "config.env")
 
 
-def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
+def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None, bar=True):
     """Runs inside Claude after every message, with the status-line payload on
     stdin. The bar stays the one configured before grazr. Claude cancels this
     command when the next update arrives, so the swap runs detached, in
@@ -533,7 +534,8 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
     payload = sys.stdin.read() if payload is None else payload
     runtime = runtime or _runtime()
     paths, store, state_dir, config = runtime
-    print(_previous_bar(state_dir, payload, spawn), end="", flush=True)
+    if bar:
+        print(_previous_bar(state_dir, payload, spawn), end="", flush=True)
 
     if not config.enabled:
         return 0
@@ -587,6 +589,13 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
         return 0
     (detach or (lambda: _detach_decide(state_dir)))()
     return 0
+
+
+def reading(runtime=None, payload=None, detach=None):
+    """A reading from a Claude whose status line is not grazr's, such as one in
+    Shepherdr's Mac sandbox. It decides what the status line would, and has no
+    bar to show."""
+    return statusline(runtime, payload, detach=detach, bar=False)
 
 
 def _log_leftovers(state_dir, now, name, expired):
@@ -866,7 +875,8 @@ def main(argv):
 def _dispatch(argv):
     entry_points = {
         "statusline": statusline, "decide": decide, "install": install, "uninstall": uninstall,
-        "status": status, "enrol": enrol, "swap": swap, "tag": tag,
+        "status": status, "enrol": enrol, "swap": swap, "tag": tag, "reading": reading,
+        "connect-autopilot": connect_autopilot, "disconnect-autopilot": disconnect_autopilot,
     }
     command = argv[1] if len(argv) > 1 else ""
     if command == "swap" and len(argv) == 3:
@@ -913,6 +923,55 @@ def install(runtime=None):
 def uninstall(runtime=None):
     paths, _, state_dir, _ = runtime or _runtime()
     print(claude.uninstall_statusline(paths.config_dir, _record_path(state_dir)))
+    return 0
+
+
+def _autopilot_command():
+    """Shepherdr's Mac sandbox runs this file outside the sandbox with each usage
+    reading on stdin. It follows the host's live login by itself, so a swap here
+    reaches sandboxed agents with no further wiring."""
+    return os.path.expanduser("~/.config/shepherdr/autopilot-usage")
+
+
+def _autopilot_script(state_dir):
+    return "#!/bin/sh\n# %s\nexec env HERDR_PLUGIN_STATE_DIR=%s HERDR_PLUGIN_CONFIG_DIR=%s python3 %s reading\n" % (
+        AUTOPILOT_MARK,
+        shlex.quote(state_dir),
+        shlex.quote(os.path.dirname(_config_path())),
+        shlex.quote(os.path.abspath(__file__)),
+    )
+
+
+def _autopilot_owner(path):
+    """Who wrote the command: None if nobody, True if grazr, False if someone else."""
+    try:
+        with open(path) as handle:
+            return AUTOPILOT_MARK in handle.read()
+    except FileNotFoundError:
+        return None
+
+
+def connect_autopilot(runtime=None):
+    _, _, state_dir, _ = runtime or _runtime()
+    path = _autopilot_command()
+    if _autopilot_owner(path) is False:
+        print("%s is someone else's, so grazr left it alone" % path)
+        return 1
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    atomic.write(path, _autopilot_script(state_dir))
+    os.chmod(path, 0o700)
+    print("grazr now reads usage from Shepherdr's Mac sandbox")
+    return 0
+
+
+def disconnect_autopilot(runtime=None):
+    path = _autopilot_command()
+    if _autopilot_owner(path) is False:
+        print("%s is someone else's, so grazr left it alone" % path)
+        return 1
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+    print("grazr no longer reads usage from Shepherdr's Mac sandbox")
     return 0
 
 

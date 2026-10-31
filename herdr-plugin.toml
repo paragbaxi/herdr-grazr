@@ -31,6 +31,20 @@ contexts = ["global", "workspace"]
 command = ["python3", "grazr.py", "uninstall"]
 
 [[actions]]
+id = "connect-autopilot"
+title = "grazr: read usage from Shepherdr's Mac sandbox"
+description = "Rotate on the usage Autopilot's sandboxed agents report, so it fires when nothing else is running"
+contexts = ["global", "workspace"]
+command = ["python3", "grazr.py", "connect-autopilot"]
+
+[[actions]]
+id = "disconnect-autopilot"
+title = "grazr: stop reading usage from Shepherdr's Mac sandbox"
+description = "Remove the command Shepherdr runs with each sandboxed usage reading"
+contexts = ["global", "workspace"]
+command = ["python3", "grazr.py", "disconnect-autopilot"]
+
+[[actions]]
 id = "tag"
 title = "grazr: tag every pane with the active account"
 description = "Publish the $grazr token to every Claude pane, for after you add the sidebar row"

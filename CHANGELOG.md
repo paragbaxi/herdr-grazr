@@ -8,6 +8,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `connect-autopilot` lets *grazr* read usage from Shepherdr's Mac sandbox, so
+  rotation still fires when Autopilot is the only thing running.
 - `REMAINING_SESSION_<name>` and `REMAINING_WEEKLY_<name>` give one account
   thresholds of its own, such as a reserve on an account you also chat on.
   Every decision about an account uses its own, whichever account is active.
