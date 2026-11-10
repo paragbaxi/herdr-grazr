@@ -1,3 +1,4 @@
+import math
 from collections import namedtuple
 
 Limit = namedtuple("Limit", "kind scope group remaining resets_at")
@@ -23,9 +24,12 @@ LAST_DAY_SECONDS = 24 * 60 * 60
 # sooner.
 SOONER_BY_SECONDS = 60 * 60
 
-# An account's own thresholds keep a reserve for its week, so they end just before
-# the week does. Whatever is still held back then would expire unused.
+# What an account holds for its owner's own use a day until its reset ends just
+# before the week does: whatever is still held back then would expire unused. Its
+# own thresholds, the buffer, hold to the end.
 RESERVE_ENDS_SECONDS = 60 * 60
+
+DAY_SECONDS = 24 * 60 * 60
 
 
 def merged(previous, current, now):
@@ -102,12 +106,37 @@ def thresholds_of(account_id, thresholds, per_account=None):
 
 
 def reserve_ended(limits, now):
-    """Whether this account's week is in its last hour, so its reserve is free to
-    spend. An account with no reading has no known week, and keeps its reserve."""
+    """Whether this account's week is in its last hour, so what it holds for its
+    owner's use until the reset is free to spend. An account with no reading has
+    no known week, and keeps it."""
+    week = _week(limits, now)
+    return week is not None and (week.resets_at - now).total_seconds() <= RESERVE_ENDS_SECONDS
+
+
+def held_daily(limits, now, daily, read_at=None):
+    """The points of an account's week its owner uses elsewhere, at `daily` a
+    day: on the web, or in a cloud session no reading here sees. What he will
+    use until the reset is held back, rounded up, except in the week's last
+    hour. What he has used since `read_at`, when the snapshot was taken, is
+    held too, rounded down, since the snapshot cannot show it. A snapshot with
+    no live week, one never read or one whose week has reset, holds nothing:
+    a fresh week has the room."""
+    week = _week(limits, now)
+    if week is None or not daily or daily <= 0:
+        return 0
+    held = 0
+    if read_at is not None and read_at < now:
+        held += int(math.floor(daily * (now - read_at).total_seconds() / DAY_SECONDS + 1e-9))
+    if not reserve_ended(limits, now):
+        held += int(math.ceil(daily * (week.resets_at - now).total_seconds() / DAY_SECONDS - 1e-9))
+    return held
+
+
+def _week(limits, now):
     for limit in limits if isinstance(limits, list) else []:
         if limit.kind == "weekly_all" and limit.resets_at and now < limit.resets_at:
-            return (limit.resets_at - now).total_seconds() <= RESERVE_ENDS_SECONDS
-    return False
+            return limit
+    return None
 
 
 def needs_rotation(limits, now, thresholds):
