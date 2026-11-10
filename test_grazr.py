@@ -2948,6 +2948,51 @@ class SwapTest(EnrolledPairFixture):
         self.measure_personal(30)
         self.assert_swapped()
 
+    def keep_off_personal(self, until_hours, hours_ago=0):
+        path = os.path.join(self.state_dir, grazr.RESERVE_FILE)
+        with open(path, "w") as f:
+            json.dump({"daily": {}, "at_reserve": {"personal": time.time() + until_hours * 3600}}, f)
+        if hours_ago:
+            then = time.time() - hours_ago * 3600
+            os.utime(path, (then, then))
+
+    def test_an_account_kept_off_refuses_a_named_swap_whatever_it_shows(self):
+        """Its snapshot here is as old as this machine's last turn on it; the
+        tool that reads every machine knows it has no room now."""
+        self.reserve_on_personal(minutes=6000, remaining=90)
+        self.keep_off_personal(until_hours=2)
+
+        code, printed = self.swap_to("personal")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.rotations, [])
+        self.assertIn("personal is kept off until", printed)
+
+    def test_one_kept_off_with_no_reading_is_not_taken_either(self):
+        """An account never read counts as fit, so being kept off must not
+        rest on its thresholds alone."""
+        self.keep_off_personal(until_hours=2)
+
+        code, printed = self.invoke(grazr.swap)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.rotations, [])
+        self.assertIn("Nothing to swap to", printed)
+
+    def test_kept_off_ends_when_it_says(self):
+        self.keep_off_personal(until_hours=-0.1)
+        self.assert_swapped()
+
+    def test_a_stale_file_keeps_nothing_off(self):
+        self.keep_off_personal(until_hours=2, hours_ago=3)
+        self.assert_swapped()
+
+    def test_status_says_it_is_kept_off(self):
+        self.keep_off_personal(until_hours=2)
+        with mock.patch.object(grazr, "read_key", lambda: None):
+            _, printed = self.invoke(grazr.status)
+        self.assertIn("kept off", printed)
+
     def test_a_named_account_can_be_given_by_id(self):
         self.enrol_spare()
 
@@ -4171,6 +4216,35 @@ class ReserveEndsWithTheWeekTest(unittest.TestCase):
         chat = core.Account("id-chat", "chat", self.week(50, 24))
         held = grazr._per_account(config, [chat], self.NOW, {"id-chat": (10, self.NOW)})
         self.assertEqual(held, {"id-chat": {"weekly": 12}})
+
+    def test_one_kept_off_is_never_fit_and_never_kept(self):
+        """herdtask keeps every machine off an account its readings put at its
+        reserve, read or not (T-467)."""
+        config = self.config({"weekly": 6})
+        work = core.Account("id-work", "work", self.week(50, 100))
+        for snapshot in (None, [], self.week(90, 30)):
+            chat = core.Account("id-chat", "chat", snapshot)
+            per_account = grazr._per_account(config, [work, chat], self.NOW, held_off={"id-chat"})
+            self.assertEqual(per_account, {"id-chat": {"weekly": core.HELD_OFF}})
+            self.assertIsNone(core.next_account("id-work", [work, chat], self.NOW, self.THRESHOLDS, per_account))
+            self.assertIsNone(core.expiring_sooner(work.snapshot, "id-work", [work, chat], self.NOW, self.THRESHOLDS, per_account))
+            self.assertEqual(core.decide(snapshot, "id-chat", [work, chat], self.NOW, self.THRESHOLDS, per_account), ("rotate", "id-work"))
+
+    def test_the_file_is_read_by_name_and_time(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, grazr.RESERVE_FILE)
+        with open(path, "w") as f:
+            json.dump({"daily": {"chat": 7.8, "bad": True}, "at_reserve": {"chat": 1794528000, "bad": "soon", "worse": True}}, f)
+        written = datetime(2026, 11, 12, 23, 30, tzinfo=timezone.utc)
+        os.utime(path, (written.timestamp(), written.timestamp()))
+        reset = datetime(2026, 11, 13, tzinfo=timezone.utc)
+        daily, until = grazr._reserve_file(directory, written)
+        self.assertEqual(daily, {"chat": 7.8})
+        self.assertEqual(until, {"chat": reset})
+        chat = core.Account("id-chat", "chat", None)
+        self.assertEqual(grazr._held_off(directory, [chat], reset - timedelta(minutes=1)), {"id-chat": reset})
+        self.assertEqual(grazr._held_off(directory, [chat], reset), {})
 
 
 if __name__ == "__main__":

@@ -210,6 +210,14 @@ and while that file is under two hours old its figure replaces the setting.
 It only counts for an account with `RESERVE_DAILY_<name>`, which stays the
 figure if the tool stops writing.
 
+The same file can keep an account off until a time, in Unix seconds:
+`{"at_reserve": {"chat": 1794528000}}`. A tool that reads every machine knows
+of use that no one machine's reading shows, and this is how it says `chat` has
+no room left above its reserve. While the file is fresh and that time has not
+come, *grazr* never picks `chat`, moves off it at the next reading, and refuses
+a swap to it by name, whatever its reading says and with no reading at all. It
+counts for any enrolled account. The status pane shows it as kept off.
+
 ### The return margin
 
 `RETURN_MARGIN` is the ten points a parked week needs above its weekly

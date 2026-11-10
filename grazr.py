@@ -65,7 +65,9 @@ RESERVE_DAILY = "RESERVE_DAILY"
 # Another tool that measures an owner's use can put its figure here, in the state
 # directory, as {"daily": {"<name>": points a day}}. It counts only for an account
 # with RESERVE_DAILY_<name>, and only while it is fresh: a tool that stopped
-# measuring must not leave a figure behind for good.
+# measuring must not leave a figure behind for good. With "at_reserve":
+# {"<name>": unix seconds} it keeps an enrolled account off until then, whatever
+# its snapshot here shows: a tool that reads every machine knows of use since.
 RESERVE_FILE = "reserve.json"
 RESERVE_FILE_FRESH_SECONDS = 2 * 60 * 60
 _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False))
@@ -271,14 +273,15 @@ def _name_of(accounts, identifier):
     return {entry.id: entry.name for entry in accounts}.get(identifier, identifier)
 
 
-def _per_account(config, enrolled, now=None, daily=None):
+def _per_account(config, enrolled, now=None, daily=None, held_off=None):
     """The thresholds accounts set for themselves, keyed by id as core takes
     them. config.env knows an account by the name enrolment gave it. Only a
     name in ACCOUNTS can set any, and ACCOUNTS is what `enrolled` is loaded
     from, so every account that sets one is found here. `daily` maps an id to
     what its owner uses a day and when its snapshot was taken, as `_daily`
     finds them: that use is held on top of its weekly threshold, see
-    core.held_daily. The thresholds themselves hold to the end of the week."""
+    core.held_daily. The thresholds themselves hold to the end of the week.
+    An id in `held_off` is kept off altogether, see core.HELD_OFF."""
     now = now or datetime.now(timezone.utc)
     out = {}
     for entry in enrolled:
@@ -286,7 +289,9 @@ def _per_account(config, enrolled, now=None, daily=None):
         rate, read_at = (daily or {}).get(entry.id, (0, None))
         held = core.held_daily(entry.snapshot, now, rate, read_at)
         if held:
-            own["weekly"] = min(101, own.get("weekly", config.thresholds["weekly"]) + held)
+            own["weekly"] = min(core.HELD_OFF, own.get("weekly", config.thresholds["weekly"]) + held)
+        if entry.id in (held_off or ()):
+            own["weekly"] = core.HELD_OFF
         if own:
             out[entry.id] = own
     return out
@@ -299,7 +304,7 @@ def _daily(paths, state_dir, config, enrolled, now=None):
     writes it on every reading of the account it is on."""
     now = now or datetime.now(timezone.utc)
     rates = dict(getattr(config, "reserve_daily", {}))
-    for name, rate in _measured_daily(state_dir, now).items():
+    for name, rate in _reserve_file(state_dir, now)[0].items():
         if name in rates:
             rates[name] = rate
     out = {}
@@ -316,28 +321,52 @@ def _daily(paths, state_dir, config, enrolled, now=None):
     return out
 
 
-def _measured_daily(state_dir, now):
+def _reserve_file(state_dir, now):
+    """RESERVE_FILE while it is fresh: each account's daily use, and when each
+    account it keeps off is free again, by name. Nothing from a file that is
+    stale, or not what it should be."""
     path = os.path.join(state_dir, RESERVE_FILE)
     try:
         age = now.timestamp() - os.path.getmtime(path)
         with open(path) as handle:
-            daily = json.load(handle).get("daily")
-    except (OSError, ValueError, AttributeError):
-        return {}
-    if not isinstance(daily, dict) or not -60 <= age <= RESERVE_FILE_FRESH_SECONDS:
-        return {}
-    return {
-        name: float(rate)
-        for name, rate in daily.items()
-        if isinstance(rate, (int, float)) and not isinstance(rate, bool) and 0 <= rate <= 100
-    }
+            measured = json.load(handle)
+    except (OSError, ValueError):
+        return {}, {}
+    if not isinstance(measured, dict) or not -60 <= age <= RESERVE_FILE_FRESH_SECONDS:
+        return {}, {}
+    daily, at_reserve = measured.get("daily"), measured.get("at_reserve")
+    return (
+        {
+            name: float(rate)
+            for name, rate in (daily.items() if isinstance(daily, dict) else ())
+            if _number(rate) and 0 <= rate <= 100
+        },
+        {
+            name: datetime.fromtimestamp(until, timezone.utc)
+            for name, until in (at_reserve.items() if isinstance(at_reserve, dict) else ())
+            if _number(until) and 0 < until < 1e11
+        },
+    )
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _held_off(state_dir, enrolled, now):
+    """When each enrolled account RESERVE_FILE keeps off is free again, by id."""
+    until = _reserve_file(state_dir, now)[1]
+    return {entry.id: until[entry.name] for entry in enrolled if now < until.get(entry.name, now)}
 
 
 def _own_thresholds(runtime, enrolled, now=None):
-    """_per_account, with what each account holds a day."""
+    """_per_account, with what each account holds a day, and those kept off."""
     paths, _, state_dir, config = runtime
     now = now or datetime.now(timezone.utc)
-    return _per_account(config, enrolled, now, _daily(paths, state_dir, config, enrolled, now))
+    return _per_account(
+        config, enrolled, now, _daily(paths, state_dir, config, enrolled, now),
+        _held_off(state_dir, enrolled, now),
+    )
 
 
 def _moved(decision, dry_run):
@@ -1032,6 +1061,11 @@ def swap(runtime=None, target=None):
             if next_id == active:
                 return _refuse_swap("Already on %s" % _name_of(enrolled, active))
             chosen = next(entry for entry in enrolled if entry.id == next_id)
+            free_at = _held_off(state_dir, [chosen], now).get(chosen.id)
+            if free_at:
+                return _refuse_swap(
+                    "%s is kept off until %s" % (chosen.name, free_at.astimezone().strftime("%a %H:%M"))
+                )
             if core.next_account(
                 active, [chosen], now, config.thresholds, _own_thresholds(runtime, enrolled, now)
             ) is None:
@@ -1134,6 +1168,8 @@ def _last_decision(state_dir):
 
 
 def _describe_thresholds(thresholds):
+    if core.held_off(thresholds):
+        return "session %d%% / kept off" % thresholds["session"]
     return "session %d%% / weekly %d%%" % (thresholds["session"], thresholds["weekly"])
 
 

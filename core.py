@@ -31,6 +31,11 @@ RESERVE_ENDS_SECONDS = 60 * 60
 
 DAY_SECONDS = 24 * 60 * 60
 
+# A weekly threshold over 100 keeps an account off altogether, as `at_reserve` in
+# grazr's reserve file sets it: no reading clears it, and an account with none
+# is not taken as fit either, nor kept while active.
+HELD_OFF = 101
+
 
 def merged(previous, current, now):
     """A window already on record keeps the lowest headroom it has shown. Idle
@@ -140,7 +145,12 @@ def _week(limits, now):
 
 
 def needs_rotation(limits, now, thresholds):
-    return not _has_headroom(limits, now, thresholds)
+    return held_off(thresholds) or not _has_headroom(limits, now, thresholds)
+
+
+def held_off(thresholds):
+    """Whether these thresholds keep their account off whatever it shows."""
+    return thresholds.get("weekly", 0) > 100
 
 
 def decide(limits, active, accounts, now, thresholds, per_account=None, return_margin=RETURN_MARGIN):
@@ -200,7 +210,7 @@ def expiring_sooner(limits, active, accounts, now, thresholds, per_account=None,
         if candidate.id == active or not isinstance(candidate.snapshot, list):
             continue
         own = thresholds_of(candidate.id, thresholds, per_account)
-        if not _has_headroom(candidate.snapshot, now, own):
+        if held_off(own) or not _has_headroom(candidate.snapshot, now, own):
             continue
         for limit in candidate.snapshot:
             if limit.group != "weekly" or not limit.resets_at or not now < limit.resets_at:
@@ -221,9 +231,10 @@ def next_account(active, accounts, now, thresholds, per_account=None):
     for candidate in accounts:
         if candidate.id == active:
             continue
-        if candidate.snapshot is None or _has_headroom(
-            candidate.snapshot, now, thresholds_of(candidate.id, thresholds, per_account)
-        ):
+        own = thresholds_of(candidate.id, thresholds, per_account)
+        if held_off(own):
+            continue
+        if candidate.snapshot is None or _has_headroom(candidate.snapshot, now, own):
             return candidate.id
     return None
 

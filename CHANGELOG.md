@@ -27,6 +27,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replaces the setting.
 - An account's own thresholds hold to the very end of its week: they are the
   buffer kept for you.
+- `"at_reserve": {"<name>": <unix seconds>}` in `reserve.json` keeps an
+  enrolled account off until then, read or not: never picked, moved off at the
+  next reading, refused by name. A tool that reads every machine knows of use
+  one machine's old snapshot cannot show.
 
 ## 0.5.3 - 2026-10-21
 
