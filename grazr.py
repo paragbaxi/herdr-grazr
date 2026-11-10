@@ -68,8 +68,11 @@ RESERVE_DAILY = "RESERVE_DAILY"
 # measuring must not leave a figure behind for good. With "at_reserve":
 # {"<name>": unix seconds} it keeps an enrolled account off until then, whatever
 # its snapshot here shows: a tool that reads every machine knows of use since.
+# That holds however old the file is, since it ends by itself, but only up to a
+# week and a day after the file was written.
 RESERVE_FILE = "reserve.json"
 RESERVE_FILE_FRESH_SECONDS = 2 * 60 * 60
+KEEP_OFF_MOST_SECONDS = 8 * 24 * 60 * 60
 _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False))
 # A margin past half the window would rule out going back for good.
 RETURN_MARGIN_CEILING = 50
@@ -322,29 +325,30 @@ def _daily(paths, state_dir, config, enrolled, now=None):
 
 
 def _reserve_file(state_dir, now):
-    """RESERVE_FILE while it is fresh: each account's daily use, and when each
-    account it keeps off is free again, by name. Nothing from a file that is
-    stale, or not what it should be."""
+    """RESERVE_FILE: each account's daily use while the file is fresh, and when
+    each account it keeps off is free again, by name. Nothing from a file that
+    is not what it should be."""
     path = os.path.join(state_dir, RESERVE_FILE)
     try:
-        age = now.timestamp() - os.path.getmtime(path)
+        written = os.path.getmtime(path)
         with open(path) as handle:
             measured = json.load(handle)
     except (OSError, ValueError):
         return {}, {}
-    if not isinstance(measured, dict) or not -60 <= age <= RESERVE_FILE_FRESH_SECONDS:
+    if not isinstance(measured, dict):
         return {}, {}
     daily, at_reserve = measured.get("daily"), measured.get("at_reserve")
+    fresh = -60 <= now.timestamp() - written <= RESERVE_FILE_FRESH_SECONDS
     return (
         {
             name: float(rate)
-            for name, rate in (daily.items() if isinstance(daily, dict) else ())
+            for name, rate in (daily.items() if fresh and isinstance(daily, dict) else ())
             if _number(rate) and 0 <= rate <= 100
         },
         {
             name: datetime.fromtimestamp(until, timezone.utc)
             for name, until in (at_reserve.items() if isinstance(at_reserve, dict) else ())
-            if _number(until) and 0 < until < 1e11
+            if _number(until) and written < until <= written + KEEP_OFF_MOST_SECONDS
         },
     )
 

@@ -2963,12 +2963,7 @@ class SwapTest(EnrolledPairFixture):
         tool that reads every machine knows it has no room now."""
         self.reserve_on_personal(minutes=6000, remaining=90)
         self.keep_off_personal(until_hours=2)
-
-        code, printed = self.swap_to("personal")
-
-        self.assertEqual(code, 1)
-        self.assertEqual(self.rotations, [])
-        self.assertIn("personal is kept off until", printed)
+        self.assert_kept_off()
 
     def test_one_kept_off_with_no_reading_is_not_taken_either(self):
         """An account never read counts as fit, so being kept off must not
@@ -2985,9 +2980,24 @@ class SwapTest(EnrolledPairFixture):
         self.keep_off_personal(until_hours=-0.1)
         self.assert_swapped()
 
-    def test_a_stale_file_keeps_nothing_off(self):
+    def test_a_stale_file_still_keeps_it_off_until_then(self):
+        """The time ends it, so it holds if the tool stops writing: herdtask
+        keeps every machine off ghee22 until its reset this week."""
         self.keep_off_personal(until_hours=2, hours_ago=3)
+        self.assert_kept_off()
+
+    def test_no_further_than_a_week_and_a_day_from_the_write(self):
+        self.keep_off_personal(until_hours=8 * 24 + 1)
         self.assert_swapped()
+        self.rotations.clear()
+        self.keep_off_personal(until_hours=7 * 24)
+        self.assert_kept_off()
+
+    def assert_kept_off(self):
+        code, printed = self.swap_to("personal")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.rotations, [])
+        self.assertIn("personal is kept off until", printed)
 
     def test_status_says_it_is_kept_off(self):
         self.keep_off_personal(until_hours=2)

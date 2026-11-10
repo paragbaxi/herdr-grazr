@@ -30,7 +30,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `"at_reserve": {"<name>": <unix seconds>}` in `reserve.json` keeps an
   enrolled account off until then, read or not: never picked, moved off at the
   next reading, refused by name. A tool that reads every machine knows of use
-  one machine's old snapshot cannot show.
+  one machine's old snapshot cannot show. It holds however old the file is,
+  up to a week and a day after it was written.
 
 ## 0.5.3 - 2026-10-21
 

@@ -217,6 +217,9 @@ no room left above its reserve. While the file is fresh and that time has not
 come, *grazr* never picks `chat`, moves off it at the next reading, and refuses
 a swap to it by name, whatever its reading says and with no reading at all. It
 counts for any enrolled account. The status pane shows it as kept off.
+Since the time ends it, it holds however old the file is, so it outlasts a
+tool that stops writing, but never past a week and a day from when the file
+was written.
 
 ### The return margin
 
