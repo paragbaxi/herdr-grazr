@@ -160,8 +160,9 @@ Readings are whole percents and *grazr* rotates once a window is below its
 threshold, so a threshold of 6 moves off at 5% left and keeps that 5% for you.
 The global `REMAINING_WEEKLY=2` runs the other accounts to 99% of their week.
 
-A reserve lasts until the last hour of that account's week, when it is free to
-spend, since it would otherwise expire unused.
+These thresholds hold to the very end of the account's week. What its owner
+uses a day can be held as well, and that part ends in the week's last hour:
+see the next section.
 
 The name goes in exactly as `ACCOUNTS` has it, case, dots and dashes included,
 as in `REMAINING_WEEKLY_me.work=6`. *grazr* reads `config.env` itself, never
@@ -179,6 +180,46 @@ without the ten points. Only when every other account keeps a reserve of its
 own does *grazr* stay on `chat`. A swap you ask for by name refuses an account
 inside its reserve, as it does any account below its thresholds. The status
 pane shows each account's thresholds where they differ from the global ones.
+
+### Holding what you use of an account a day
+
+If you use an account elsewhere every day, such as in a cloud session, a fixed
+reserve is too much early in the week and too little late in it.
+`RESERVE_DAILY_<name>` holds what you use of it a day for each day left until
+its week resets, on top of its weekly threshold:
+
+```sh
+REMAINING_WEEKLY_chat=6    # the buffer: 5% kept to the very end
+RESERVE_DAILY_chat=10      # and 10% for each day left
+```
+
+With 2.2 days left that is 6 + 22, so *grazr* moves off `chat` at 27% left and
+never picks it below that. The hold shrinks as the reset nears, and in the last
+hour of the week only the threshold stays: whatever else is held then would
+expire unused.
+
+Each machine's reading of a parked account is as old as the last turn there,
+and your own use has gone on since. So what you would have used since that
+reading, rounded down, is held too: an old reading never makes an account look
+better off than it is. An account with no reading of its week, never read or
+just reset, holds nothing more, since a fresh week has the room.
+
+Another tool that measures your use can refine the figure. It writes
+`{"daily": {"chat": 6.7}}` to `reserve.json` in the plugin's state directory,
+and while that file is under two hours old its figure replaces the setting.
+It only counts for an account with `RESERVE_DAILY_<name>`, which stays the
+figure if the tool stops writing.
+
+The same file can keep an account off until a time, in Unix seconds:
+`{"at_reserve": {"chat": 1794528000}}`. A tool that reads every machine knows
+of use that no one machine's reading shows, and this is how it says `chat` has
+no room left above its reserve. While the file is fresh and that time has not
+come, *grazr* never picks `chat`, moves off it at the next reading, and refuses
+a swap to it by name, whatever its reading says and with no reading at all. It
+counts for any enrolled account. The status pane shows it as kept off.
+Since the time ends it, it holds however old the file is, so it outlasts a
+tool that stops writing, but never past a week and a day from when the file
+was written.
 
 ### The return margin
 

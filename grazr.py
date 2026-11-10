@@ -31,10 +31,12 @@ import stores
 # `account_thresholds` maps an account name, as written in ACCOUNTS, to the
 # thresholds it sets for itself. `return_margin` is how many points above its
 # threshold a parked account needs before going back for its week is worth a swap.
+# `reserve_daily` maps an account name to the points of its week its owner uses a
+# day elsewhere, held until the reset on top of its weekly threshold.
 Config = namedtuple(
     "Config",
-    "thresholds accounts enabled dry_run account_thresholds return_margin",
-    defaults=({}, core.RETURN_MARGIN),
+    "thresholds accounts enabled dry_run account_thresholds return_margin reserve_daily",
+    defaults=({}, core.RETURN_MARGIN, {}),
 )
 
 Runtime = namedtuple("Runtime", "paths store state_dir config")
@@ -45,6 +47,8 @@ REMAINING_SESSION=15     # the 5-hour window
 REMAINING_WEEKLY=10      # weekly windows, incl. per-model ones
 # One account can keep its own, e.g. a reserve on one you also chat on:
 # REMAINING_WEEKLY_personal=30
+# and hold what you use of it a day until its week resets:
+# RESERVE_DAILY_personal=10
 
 # Points above its threshold a parked week needs before going back for it.
 RETURN_MARGIN=10
@@ -57,6 +61,18 @@ DRY_RUN=0                # 1 = log the decision, do not swap
 """
 
 _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("weekly", 10)}
+RESERVE_DAILY = "RESERVE_DAILY"
+# Another tool that measures an owner's use can put its figure here, in the state
+# directory, as {"daily": {"<name>": points a day}}. It counts only for an account
+# with RESERVE_DAILY_<name>, and only while it is fresh: a tool that stopped
+# measuring must not leave a figure behind for good. With "at_reserve":
+# {"<name>": unix seconds} it keeps an enrolled account off until then, whatever
+# its snapshot here shows: a tool that reads every machine knows of use since.
+# That holds however old the file is, since it ends by itself, but only up to a
+# week and a day after the file was written.
+RESERVE_FILE = "reserve.json"
+RESERVE_FILE_FRESH_SECONDS = 2 * 60 * 60
+KEEP_OFF_MOST_SECONDS = 8 * 24 * 60 * 60
 _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False))
 # A margin past half the window would rule out going back for good.
 RETURN_MARGIN_CEILING = 50
@@ -228,7 +244,7 @@ def act_on(decision, runtime, active_id, limits, enrolled=(), now=None):
     note = claude.rotate(paths, store, active_id, next_id, limits)
     accounts.mark_first_reading_due(paths, next_id)
     now = now or datetime.now(timezone.utc)
-    per_account = _per_account(config, enrolled)
+    per_account = _own_thresholds(runtime, enrolled, now)
     own = core.thresholds_of(active_id, config.thresholds, per_account)
     low = core.shortfall(limits or [], now, own)
     if low:
@@ -260,18 +276,101 @@ def _name_of(accounts, identifier):
     return {entry.id: entry.name for entry in accounts}.get(identifier, identifier)
 
 
-def _per_account(config, enrolled, now=None):
+def _per_account(config, enrolled, now=None, daily=None, held_off=None):
     """The thresholds accounts set for themselves, keyed by id as core takes
     them. config.env knows an account by the name enrolment gave it. Only a
     name in ACCOUNTS can set any, and ACCOUNTS is what `enrolled` is loaded
-    from, so every account that sets one is found here. An account in the last
-    hour of its week has none: its reserve is spendable then."""
+    from, so every account that sets one is found here. `daily` maps an id to
+    what its owner uses a day and when its snapshot was taken, as `_daily`
+    finds them: that use is held on top of its weekly threshold, see
+    core.held_daily. The thresholds themselves hold to the end of the week.
+    An id in `held_off` is kept off altogether, see core.HELD_OFF."""
     now = now or datetime.now(timezone.utc)
-    return {
-        entry.id: config.account_thresholds[entry.name]
-        for entry in enrolled
-        if entry.name in config.account_thresholds and not core.reserve_ended(entry.snapshot, now)
-    }
+    out = {}
+    for entry in enrolled:
+        own = dict(getattr(config, "account_thresholds", {}).get(entry.name, {}))
+        rate, read_at = (daily or {}).get(entry.id, (0, None))
+        held = core.held_daily(entry.snapshot, now, rate, read_at)
+        if held:
+            own["weekly"] = min(core.HELD_OFF, own.get("weekly", config.thresholds["weekly"]) + held)
+        if entry.id in (held_off or ()):
+            own["weekly"] = core.HELD_OFF
+        if own:
+            out[entry.id] = own
+    return out
+
+
+def _daily(paths, state_dir, config, enrolled, now=None):
+    """What each account with RESERVE_DAILY_<name> holds a day, by id, and when
+    its snapshot was taken. A fresh figure in RESERVE_FILE replaces the
+    setting: another tool measured it. The snapshot's time is its file's: grazr
+    writes it on every reading of the account it is on."""
+    now = now or datetime.now(timezone.utc)
+    rates = dict(getattr(config, "reserve_daily", {}))
+    for name, rate in _reserve_file(state_dir, now)[0].items():
+        if name in rates:
+            rates[name] = rate
+    out = {}
+    for entry in enrolled:
+        if entry.name not in rates:
+            continue
+        try:
+            read_at = datetime.fromtimestamp(
+                os.path.getmtime(os.path.join(paths.accounts_dir, entry.id + ".json")), timezone.utc
+            )
+        except (OSError, ValueError, AttributeError):
+            read_at = None
+        out[entry.id] = (rates[entry.name], read_at)
+    return out
+
+
+def _reserve_file(state_dir, now):
+    """RESERVE_FILE: each account's daily use while the file is fresh, and when
+    each account it keeps off is free again, by name. Nothing from a file that
+    is not what it should be."""
+    path = os.path.join(state_dir, RESERVE_FILE)
+    try:
+        written = os.path.getmtime(path)
+        with open(path) as handle:
+            measured = json.load(handle)
+    except (OSError, ValueError):
+        return {}, {}
+    if not isinstance(measured, dict):
+        return {}, {}
+    daily, at_reserve = measured.get("daily"), measured.get("at_reserve")
+    fresh = -60 <= now.timestamp() - written <= RESERVE_FILE_FRESH_SECONDS
+    return (
+        {
+            name: float(rate)
+            for name, rate in (daily.items() if fresh and isinstance(daily, dict) else ())
+            if _number(rate) and 0 <= rate <= 100
+        },
+        {
+            name: datetime.fromtimestamp(until, timezone.utc)
+            for name, until in (at_reserve.items() if isinstance(at_reserve, dict) else ())
+            if _number(until) and written < until <= written + KEEP_OFF_MOST_SECONDS
+        },
+    )
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _held_off(state_dir, enrolled, now):
+    """When each enrolled account RESERVE_FILE keeps off is free again, by id."""
+    until = _reserve_file(state_dir, now)[1]
+    return {entry.id: until[entry.name] for entry in enrolled if now < until.get(entry.name, now)}
+
+
+def _own_thresholds(runtime, enrolled, now=None):
+    """_per_account, with what each account holds a day, and those kept off."""
+    paths, _, state_dir, config = runtime
+    now = now or datetime.now(timezone.utc)
+    return _per_account(
+        config, enrolled, now, _daily(paths, state_dir, config, enrolled, now),
+        _held_off(state_dir, enrolled, now),
+    )
 
 
 def _moved(decision, dry_run):
@@ -417,6 +516,7 @@ def load_config(path):
     # is not in ACCOUNTS is refused, since a misspelt name would be a reserve
     # that never holds.
     account_thresholds = {}
+    reserve_daily = {}
     for key in sorted(settings):
         for prefix, (group, _) in _THRESHOLD_KEYS.items():
             if not key.startswith(prefix + "_"):
@@ -425,6 +525,11 @@ def load_config(path):
             if name not in accounts:
                 raise ValueError("%s sets a threshold for %r, which is not in ACCOUNTS" % (key, name))
             account_thresholds.setdefault(name, {})[group] = _percent(settings.pop(key), key, None)
+        if key.startswith(RESERVE_DAILY + "_"):
+            name = key[len(RESERVE_DAILY) + 1:]
+            if name not in accounts:
+                raise ValueError("%s holds a reserve for %r, which is not in ACCOUNTS" % (key, name))
+            reserve_daily[name] = _percent(settings.pop(key), key, None)
     if settings:
         raise ValueError("Unknown setting(s): %s" % ", ".join(sorted(settings)))
 
@@ -435,6 +540,7 @@ def load_config(path):
         dry_run=flags[1],
         account_thresholds=account_thresholds,
         return_margin=return_margin,
+        reserve_daily=reserve_daily,
     )
 
 
@@ -577,7 +683,7 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
             if expired:
                 _log_leftovers(state_dir, now, parked.name, expired)
                 accounts.record_snapshot(paths, parked.id, core.merged(parked.snapshot, [], now))
-    per_account = _per_account(config, enrolled)
+    per_account = _own_thresholds(runtime, enrolled, now)
     if not core.needs_rotation(
         limits, now, core.thresholds_of(active, config.thresholds, per_account)
     ) and not core.expiring_sooner(
@@ -722,7 +828,7 @@ def decide(runtime=None):
         enrolled = accounts.load(paths, config.accounts)
         decision = core.decide(
             limits, active, enrolled, now, config.thresholds,
-            _per_account(config, enrolled), config.return_margin,
+            _own_thresholds(runtime, enrolled, now), config.return_margin,
         )
         # rotate refuses this too, but a raised error suits the person who just
         # pressed a key, not every message of every pane.
@@ -959,8 +1065,13 @@ def swap(runtime=None, target=None):
             if next_id == active:
                 return _refuse_swap("Already on %s" % _name_of(enrolled, active))
             chosen = next(entry for entry in enrolled if entry.id == next_id)
+            free_at = _held_off(state_dir, [chosen], now).get(chosen.id)
+            if free_at:
+                return _refuse_swap(
+                    "%s is kept off until %s" % (chosen.name, free_at.astimezone().strftime("%a %H:%M"))
+                )
             if core.next_account(
-                active, [chosen], now, config.thresholds, _per_account(config, enrolled)
+                active, [chosen], now, config.thresholds, _own_thresholds(runtime, enrolled, now)
             ) is None:
                 # The next reading would move off it again: two swaps for one
                 # message.
@@ -973,7 +1084,7 @@ def swap(runtime=None, target=None):
         else:
             enrolled = accounts.load(paths, config.accounts)
             next_id = core.next_account(
-                active, enrolled, now, config.thresholds, _per_account(config, enrolled)
+                active, enrolled, now, config.thresholds, _own_thresholds(runtime, enrolled, now)
             )
         if next_id is None:
             # The account you are on is never a swap target, so its reset says
@@ -1007,7 +1118,8 @@ def _refuse_swap(reason):
 
 
 def status(runtime=None):
-    paths, store, state_dir, config = runtime or _runtime()
+    runtime = runtime or _runtime()
+    paths, store, state_dir, config = runtime
     active = claude.active_account(paths)
 
     print("config: %s" % _config_path())
@@ -1018,7 +1130,7 @@ def status(runtime=None):
              "   DRY_RUN" if config.dry_run else ""))
 
     enrolled = accounts.load(paths, config.accounts)
-    per_account = _per_account(config, enrolled)
+    per_account = _own_thresholds(runtime, enrolled)
     for account in enrolled:
         marker = "*" if account.id == active else " "
         parked = "parked" if accounts.has_parked_credential(store, account.id) else "NO CREDENTIAL"
@@ -1060,6 +1172,8 @@ def _last_decision(state_dir):
 
 
 def _describe_thresholds(thresholds):
+    if core.held_off(thresholds):
+        return "session %d%% / kept off" % thresholds["session"]
     return "session %d%% / weekly %d%%" % (thresholds["session"], thresholds["weekly"])
 
 
