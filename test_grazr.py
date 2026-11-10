@@ -30,6 +30,13 @@ SOONER = datetime(2026, 9, 4, 14, 0, tzinfo=timezone.utc)
 THRESHOLDS = {"session": 15, "weekly": 20}
 
 
+def stamp(path, hours_ago=0):
+    """Date a file by grazr's clock, which is not the file system's when the
+    suite runs with a shifted one."""
+    then = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).timestamp()
+    os.utime(path, (then, then))
+
+
 def clock(when):
     """How grazr names a reset time to a person: local weekday and time."""
     return when.astimezone().strftime("%a %H:%M")
@@ -2881,17 +2888,13 @@ class SwapTest(EnrolledPairFixture):
                 },
                 f,
             )
-        if read_hours_ago:
-            then = time.time() - read_hours_ago * 3600
-            os.utime(path, (then, then))
+        stamp(path, read_hours_ago)
 
     def measure_personal(self, daily, hours_ago=0):
         path = os.path.join(self.state_dir, grazr.RESERVE_FILE)
         with open(path, "w") as f:
             json.dump({"daily": {"personal": daily}}, f)
-        if hours_ago:
-            then = time.time() - hours_ago * 3600
-            os.utime(path, (then, then))
+        stamp(path, hours_ago)
 
     def assert_refused(self):
         code, printed = self.swap_to("personal")
@@ -2951,10 +2954,9 @@ class SwapTest(EnrolledPairFixture):
     def keep_off_personal(self, until_hours, hours_ago=0):
         path = os.path.join(self.state_dir, grazr.RESERVE_FILE)
         with open(path, "w") as f:
-            json.dump({"daily": {}, "at_reserve": {"personal": time.time() + until_hours * 3600}}, f)
-        if hours_ago:
-            then = time.time() - hours_ago * 3600
-            os.utime(path, (then, then))
+            until = datetime.now(timezone.utc) + timedelta(hours=until_hours)
+            json.dump({"daily": {}, "at_reserve": {"personal": until.timestamp()}}, f)
+        stamp(path, hours_ago)
 
     def test_an_account_kept_off_refuses_a_named_swap_whatever_it_shows(self):
         """Its snapshot here is as old as this machine's last turn on it; the
