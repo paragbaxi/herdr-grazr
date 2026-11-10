@@ -1,4 +1,3 @@
-import math
 from collections import namedtuple
 
 Limit = namedtuple("Limit", "kind scope group remaining resets_at")
@@ -131,10 +130,15 @@ def held_daily(limits, now, daily, read_at=None):
         return 0
     held = 0
     if read_at is not None and read_at < now:
-        held += int(math.floor(daily * (now - read_at).total_seconds() / DAY_SECONDS + 1e-9))
+        held += _floor(daily * (now - read_at).total_seconds() / DAY_SECONDS + 1e-9)
     if not reserve_ended(limits, now):
-        held += int(math.ceil(daily * (week.resets_at - now).total_seconds() / DAY_SECONDS - 1e-9))
+        held += -_floor(-(daily * (week.resets_at - now).total_seconds() / DAY_SECONDS - 1e-9))
     return held
+
+
+def _floor(x):
+    """math.floor, without the import: the core imports only collections."""
+    return int(x // 1)
 
 
 def _week(limits, now):
