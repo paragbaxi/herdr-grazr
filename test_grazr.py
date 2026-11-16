@@ -29,6 +29,37 @@ EARLIER = datetime(2026, 9, 4, 7, 0, tzinfo=timezone.utc)
 SOONER = datetime(2026, 9, 4, 14, 0, tzinfo=timezone.utc)
 THRESHOLDS = {"session": 15, "weekly": 20}
 
+# The real one, kept before the suite replaces it, for the one test of what it sends.
+REAL_FETCH_PROFILE = getattr(claude, "fetch_profile", None)
+
+
+def offline_profile(access_token):
+    raise OSError("the suite never reaches Anthropic")
+
+
+def setUpModule():
+    """No test reaches Anthropic: whose login a token is reads as unknown, as it
+    does offline, unless a test answers for it."""
+    patcher = mock.patch.object(claude, "fetch_profile", side_effect=offline_profile, create=True)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
+def profile(account_uuid, email=None):
+    """What Anthropic's profile endpoint answers for a login."""
+    return {"account": {"uuid": account_uuid, "email": email or account_uuid + "@example.com"}}
+
+
+# A day past the suite's start, so every fresh login of a run is the same blob.
+FRESH_UNTIL = int((time.time() + 24 * 3600) * 1000)
+
+
+def fresh_login(refresh):
+    """A login whose access token has not expired, so its owner can be asked."""
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": "access-" + refresh, "refreshToken": refresh, "expiresAt": FRESH_UNTIL,
+    }})
+
 
 def stamp(path, hours_ago=0):
     """Date a file by grazr's clock, which is not the file system's when the
@@ -2634,6 +2665,8 @@ class EnrolledPairFixture(unittest.TestCase):
         self.lock_free_while_tagging = []
 
     def record_rotation(self, *arguments):
+        if isinstance(self.refusal, Exception):
+            raise self.refusal
         if self.refusal:
             raise RuntimeError(self.refusal)
         self.rotations.append(arguments)
@@ -4334,6 +4367,287 @@ class KeepParkedCurrentTest(EnrolledPairFixture):
             self.invoke(lambda runtime: grazr.statusline(runtime, json.dumps({}), detach=lambda: None))
 
         self.assertEqual(self.store.parked["uuid-work"], login_blob("work-2"))
+
+
+class WrongLoginTest(unittest.TestCase):
+    """A login is saved under an account's name only when it is that account's
+    (2026-11-15: on the Mac, Claude's config was switched to ghee22 outside grazr
+    while demo's login was live, and the next rotations parked demo's login as
+    ghee22, so ghee22's own login was lost until a browser sign-in). Claude's
+    config names an account; only the token says whose login it is."""
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.accounts_dir = os.path.join(self.directory, "accounts")
+        os.mkdir(self.accounts_dir)
+        self.config_path = os.path.join(self.directory, ".claude.json")
+        with open(self.config_path, "w") as handle:
+            json.dump({"oauthAccount": {"accountUuid": "uuid-work"}}, handle)
+        for identifier, name in (("uuid-work", "work"), ("uuid-personal", "personal")):
+            with open(os.path.join(self.accounts_dir, identifier + ".json"), "w") as handle:
+                json.dump({"name": name, "oauthAccount": {"accountUuid": identifier}}, handle)
+        self.paths = claude.Paths(
+            config_path=self.config_path, config_dir=self.directory, accounts_dir=self.accounts_dir,
+        )
+        self.store = FakeStore(
+            live=fresh_login("work-1"),
+            parked={"uuid-work": fresh_login("work-0"), "uuid-personal": fresh_login("personal-1")},
+        )
+
+    def run_rotate(self):
+        return claude.rotate(self.paths, self.store, "uuid-work", "uuid-personal", None)
+
+    def identity(self):
+        with open(self.config_path) as handle:
+            return json.load(handle)["oauthAccount"]["accountUuid"]
+
+    def test_a_rotation_never_parks_another_accounts_login_under_the_one_leaving(self):
+        self.store.live = fresh_login("personal-2")
+        with mock.patch.object(claude, "fetch_profile", return_value=profile("uuid-personal")):
+            with self.assertRaises(claude.WrongLogin) as refused:
+                self.run_rotate()
+
+        self.assertEqual(self.store.events, [])
+        self.assertEqual(self.identity(), "uuid-work")
+        self.assertIn("personal", str(refused.exception))
+        self.assertIn("work", str(refused.exception))
+        self.assertEqual(
+            (refused.exception.saving_name, refused.exception.holder_name), ("work", "personal")
+        )
+
+    def test_the_replay_is_refused_offline_by_the_login_grazr_keeps_for_the_other_account(self):
+        """19:58:59 on the Mac: Claude's config said ghee22, the live login was the
+        one grazr had just installed for demo, and Anthropic need not be asked to
+        see that it is demo's."""
+        self.store.live = self.store.parked["uuid-personal"]
+
+        with self.assertRaises(claude.WrongLogin):
+            self.run_rotate()
+
+        self.assertEqual(self.store.events, [])
+
+    def test_a_login_that_is_the_accounts_own_rotates(self):
+        with mock.patch.object(claude, "fetch_profile", return_value=profile("uuid-work")):
+            self.run_rotate()
+
+        self.assertEqual(self.store.parked["uuid-work"], fresh_login("work-1"))
+        self.assertEqual(self.identity(), "uuid-personal")
+
+    def test_a_login_whose_owner_cannot_be_told_still_rotates(self):
+        """Offline, or a token that has expired: nothing says it is someone else's,
+        and refusing would leave the pane on an account that has run out."""
+        self.run_rotate()
+
+        self.assertEqual(self.store.parked["uuid-work"], fresh_login("work-1"))
+
+    def test_an_expired_token_is_never_sent_or_refreshed(self):
+        """Refreshing would replace the refresh token Claude holds, signing it out."""
+        self.store.live = login_blob("work-1")
+        with mock.patch.object(claude, "fetch_profile") as fetch:
+            self.run_rotate()
+
+        fetch.assert_not_called()
+
+    def test_anthropic_is_asked_once_per_login(self):
+        with mock.patch.object(claude, "fetch_profile", return_value=profile("uuid-work")) as fetch:
+            for _ in range(3):
+                claude.check_owner(self.paths, self.store, self.store.live, "uuid-work")
+
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(
+            sorted(name for name in os.listdir(self.accounts_dir) if not name.startswith(".")),
+            sorted(["uuid-work.json", "uuid-personal.json"]),
+            "what grazr keeps of an answer is no account",
+        )
+
+    def test_the_refusal_never_holds_a_token(self):
+        self.store.live = fresh_login("personal-2")
+        with mock.patch.object(claude, "fetch_profile", return_value=profile("uuid-personal")):
+            with self.assertRaises(claude.WrongLogin) as refused:
+                self.run_rotate()
+
+        self.assertNotIn("access-personal-2", str(refused.exception))
+        self.assertNotIn("personal-2", str(refused.exception))
+        for name in os.listdir(self.accounts_dir):
+            with open(os.path.join(self.accounts_dir, name)) as handle:
+                self.assertNotIn("personal-2", handle.read(), name)
+
+    def test_an_owner_grazr_never_enrolled_is_named_by_its_address(self):
+        self.store.live = fresh_login("stranger-1")
+        stranger = "44444444-4444-4444-8444-444444444444"
+        with mock.patch.object(claude, "fetch_profile", return_value=profile(stranger, "s@example.com")):
+            with self.assertRaises(claude.WrongLogin) as refused:
+                self.run_rotate()
+
+        self.assertEqual(refused.exception.holder_name, "s@example.com")
+
+    def test_enrolment_refuses_a_login_that_is_not_the_configs_account(self):
+        with open(self.config_path, "w") as handle:
+            json.dump({"oauthAccount": {"accountUuid": EnrolTest.WORK}}, handle)
+        with mock.patch.object(claude, "fetch_profile", return_value=profile(EnrolTest.PERSONAL)):
+            with self.assertRaises(claude.WrongLogin):
+                claude.enrol(self.paths, self.store, "work2")
+
+        self.assertEqual(self.store.events, [])
+
+    def test_the_profile_request_sends_the_token_only_to_anthropic(self):
+        """The same request Claude makes at sign-in, with the login's own token."""
+        sent = []
+
+        class Answer(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        def urlopen(request, timeout):
+            sent.append((request.full_url, dict(request.header_items()), timeout))
+            return Answer(json.dumps(profile("uuid-work")).encode())
+
+        with mock.patch("urllib.request.urlopen", urlopen):
+            answer = REAL_FETCH_PROFILE("access-work-1")
+
+        self.assertEqual(answer["account"]["uuid"], "uuid-work")
+        (url, headers, timeout), = sent
+        self.assertEqual(url, "https://api.anthropic.com/api/oauth/profile")
+        self.assertEqual(headers.get("Authorization"), "Bearer access-work-1")
+        self.assertLessEqual(timeout, 10)
+
+
+class WrongLoginReportTest(EnrolledPairFixture):
+    """A refusal goes to grazr.log and to ALERT_COMMAND, with the machine and both
+    account names, once a day for the same pair, and never with a token."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_config('ACCOUNTS="work personal"\nALERT_COMMAND="~/bin/tell mayor"\n')
+        self.alerts = []
+        patcher = mock.patch.object(grazr, "_run_alert", lambda argv, state_dir: self.alerts.append(argv))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.store = FakeStore(
+            live=fresh_login("personal-2"),
+            parked={"uuid-work": fresh_login("work-1"), "uuid-personal": fresh_login("personal-1")},
+        )
+
+    def runtime(self):
+        return super().runtime()._replace(store=self.store)
+
+    def wrong_login(self):
+        return claude.WrongLogin(
+            saving_as="uuid-work", saving_name="work",
+            holder="uuid-personal", holder_name="personal", how="Anthropic says so",
+        )
+
+    def log(self):
+        try:
+            with open(os.path.join(self.state_dir, grazr.LOG)) as handle:
+                return handle.read()
+        except FileNotFoundError:
+            return ""
+
+    def message(self, used=10):
+        payload = json.dumps({"rate_limits": {"five_hour": {"used_percentage": used, "resets_at": None}}})
+        return self.invoke(lambda runtime: grazr.statusline(runtime, payload, detach=lambda: None))
+
+    def test_keeping_the_parked_copy_current_never_saves_another_accounts_login(self):
+        with mock.patch.object(claude, "fetch_profile", return_value=profile("uuid-personal")):
+            for _ in range(3):
+                self.message()
+
+        self.assertEqual(self.store.parked["uuid-work"], fresh_login("work-1"))
+        self.assertIn("personal", self.log())
+        self.assertIn(grazr._host(), self.log())
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_the_alert_names_the_machine_and_both_accounts(self):
+        with mock.patch.object(claude, "fetch_profile", return_value=profile("uuid-personal")):
+            self.message()
+            self.message()
+
+        (argv,) = self.alerts
+        self.assertEqual(argv[:2], [os.path.expanduser("~/bin/tell"), "mayor"])
+        said = " ".join(argv[2:])
+        for word in (grazr._host(), "work", "personal"):
+            self.assertIn(word, said)
+
+    def test_no_token_reaches_the_log_or_the_alert(self):
+        with mock.patch.object(claude, "fetch_profile", return_value=profile("uuid-personal")):
+            self.message()
+            self.message()
+
+        for said in [self.log()] + [" ".join(argv) for argv in self.alerts]:
+            self.assertNotIn("personal-2", said)
+            self.assertNotIn("work-1", said)
+
+    def test_a_refused_rotation_is_logged_and_alerted_once(self):
+        self.refusal = self.wrong_login()
+
+        for _ in range(3):
+            self.write_account_snapshot("uuid-work", 5)
+            self.invoke(grazr.decide)
+
+        self.assertEqual(len(self.alerts), 1)
+        self.assertEqual(self.log().count("won't save"), 1)
+
+    def test_the_same_pair_alerts_again_after_a_day(self):
+        self.refusal = self.wrong_login()
+        self.write_account_snapshot("uuid-work", 5)
+        self.invoke(grazr.decide)
+        with open(os.path.join(self.state_dir, grazr.WRONG_LOGIN_FILE)) as handle:
+            told = json.load(handle)
+        with open(os.path.join(self.state_dir, grazr.WRONG_LOGIN_FILE), "w") as handle:
+            json.dump({key: when - 25 * 3600 for key, when in told.items()}, handle)
+
+        self.invoke(grazr.decide)
+
+        self.assertEqual(len(self.alerts), 2)
+
+    def test_a_refused_swap_is_shown_and_alerted(self):
+        self.refusal = self.wrong_login()
+
+        code, printed = self.invoke(grazr.swap)
+
+        self.assertEqual(code, 1)
+        self.assertIn("won't save it as work", printed)
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_without_alert_command_it_is_only_logged(self):
+        self.write_config('ACCOUNTS="work personal"\n')
+        self.refusal = self.wrong_login()
+        self.write_account_snapshot("uuid-work", 5)
+
+        self.invoke(grazr.decide)
+
+        self.assertEqual(self.alerts, [])
+        self.assertIn("won't save", self.log())
+
+
+class AlertCommandConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.path = os.path.join(self.directory, "config.env")
+
+    def load(self, text):
+        with open(self.path, "w") as handle:
+            handle.write(text)
+        return grazr.load_config(self.path)
+
+    def test_it_is_off_unless_set(self):
+        self.assertEqual(self.load('ACCOUNTS="a b"\n').alert_command, "")
+
+    def test_it_reads_a_command_with_arguments(self):
+        self.assertEqual(
+            self.load('ALERT_COMMAND="~/.local/bin/herdtask mail-mayor"\n').alert_command,
+            "~/.local/bin/herdtask mail-mayor",
+        )
+
+    def test_a_command_that_will_not_split_is_refused_by_name(self):
+        with self.assertRaisesRegex(ValueError, "ALERT_COMMAND"):
+            self.load("ALERT_COMMAND='tell \"mayor'\n")
 
 
 if __name__ == "__main__":
