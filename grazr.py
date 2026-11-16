@@ -645,6 +645,7 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
 
     if not config.enabled:
         return 0
+    _keep_parked_current(runtime)
     limits = claude.statusline_limits(payload)
     if limits is None:
         _warn_unreadable(state_dir, payload)
@@ -695,6 +696,47 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
         return 0
     (detach or (lambda: _detach_decide(state_dir)))()
     return 0
+
+
+LIVE_SEEN_FILE = "live-seen.json"
+
+
+def _keep_parked_current(runtime):
+    """Park the live credential again when Claude has refreshed it. Each refresh
+    replaces the refresh token, so the copy parked at the last swap stops working,
+    and a login made outside grazr takes the live one with it: going back to that
+    account then signs the pane out (2026-11-16, "OAuth token revoked" on every
+    swap back). A change is parked once a second message sees it under the same
+    account, so a login caught between writing its credential and its identity is
+    never parked under the account it replaces. Never stops the status line."""
+    paths, store, state_dir, _ = runtime
+    seen_path = os.path.join(state_dir, LIVE_SEEN_FILE)
+    try:
+        active = claude.active_account(paths)
+        live = store.read_live()
+        parked = store.read_parked(active) if active else None
+        if live is None or parked is None or claude._same_login(live, parked):
+            return
+        digest = claude._digest(claude._parkable(live))
+        try:
+            with open(seen_path) as handle:
+                seen = json.load(handle)
+        except (OSError, ValueError):
+            seen = {}
+        if seen != {"account": active, "live": digest}:
+            atomic.write(seen_path, json.dumps({"account": active, "live": digest}))
+            return
+        with _rotation_lock(state_dir) as acquired:
+            if not acquired or claude._read_swap_marker(paths) is not None:
+                return
+            live = store.read_live()
+            if claude.active_account(paths) != active or live is None:
+                return
+            if claude._digest(claude._parkable(live)) != digest:
+                return
+            store.write_parked(active, claude._parkable(live))
+    except (OSError, ValueError, RuntimeError):
+        pass
 
 
 def _log_leftovers(state_dir, now, name, expired):
