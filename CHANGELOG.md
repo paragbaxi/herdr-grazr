@@ -33,6 +33,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one machine's old snapshot cannot show. It holds however old the file is,
   up to a week and a day after it was written.
 
+### Fixed
+
+- The parked copy of the account you're on is kept current as Claude refreshes
+  its token. Each refresh replaces the refresh token, so a login made outside
+  grazr, such as `/login`, used to take the only working copy with it, and
+  every swap back to that account signed the pane out ("OAuth token revoked").
+
 ## 0.5.3 - 2026-10-21
 
 ### Fixed

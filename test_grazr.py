@@ -4259,5 +4259,82 @@ class ReserveEndsWithTheWeekTest(unittest.TestCase):
         self.assertEqual(grazr._held_off(directory, [chat], reset), {})
 
 
+def login_blob(refresh):
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": "access-" + refresh, "refreshToken": refresh, "expiresAt": 1,
+    }})
+
+
+class KeepParkedCurrentTest(EnrolledPairFixture):
+    """Claude replaces the refresh token each time it refreshes, so a parked copy
+    taken at the last swap holds a token that no longer works. A login made outside
+    grazr then takes the live one with it, and going back to the account signs the
+    pane out (2026-11-16: "OAuth token revoked" on every swap back to demo). So the
+    live credential is parked again once two messages in a row see it changed under
+    the same account."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = FakeStore(
+            live=login_blob("work-1"),
+            parked={"uuid-work": login_blob("work-1"), "uuid-personal": login_blob("personal-1")},
+        )
+
+    def runtime(self):
+        return super().runtime()._replace(store=self.store)
+
+    def message(self):
+        payload = json.dumps({"rate_limits": {"five_hour": {"used_percentage": 10, "resets_at": None}}})
+        return self.invoke(lambda runtime: grazr.statusline(runtime, payload, detach=lambda: None))
+
+    def parks(self):
+        return [event for event in self.store.events if event[0] == "write_parked"]
+
+    def test_a_refreshed_token_is_parked_once_a_second_message_sees_it(self):
+        self.store.live = login_blob("work-2")
+
+        self.message()
+        self.assertEqual(self.parks(), [])
+        self.message()
+
+        self.assertEqual(self.store.parked["uuid-work"], login_blob("work-2"))
+        self.assertEqual(self.store.parked["uuid-personal"], login_blob("personal-1"))
+
+    def test_an_unchanged_login_writes_nothing(self):
+        self.message()
+        self.message()
+
+        self.assertEqual(self.parks(), [])
+
+    def test_a_login_caught_between_its_two_writes_is_never_parked_under_the_old_account(self):
+        """Claude writes a new login's credential, then its identity. A message
+        between the two sees personal's token under work's name."""
+        self.store.live = login_blob("personal-2")
+        self.message()
+        self.write_login("uuid-personal")
+        self.message()
+
+        self.assertEqual(self.store.parked["uuid-work"], login_blob("work-1"))
+        self.message()
+        self.assertEqual(self.store.parked["uuid-personal"], login_blob("personal-2"))
+
+    def test_a_half_done_swap_is_left_to_its_retry(self):
+        self.store.live = login_blob("work-2")
+        claude._write_swap_marker(self.runtime().paths, "uuid-work", "uuid-personal", login_blob("work-1"))
+
+        self.message()
+        self.message()
+
+        self.assertEqual(self.parks(), [])
+
+    def test_a_status_line_with_no_limits_still_keeps_it_current(self):
+        """Some Claude versions send no rate limits, and grazr reads nothing then."""
+        self.store.live = login_blob("work-2")
+        for _ in range(2):
+            self.invoke(lambda runtime: grazr.statusline(runtime, json.dumps({}), detach=lambda: None))
+
+        self.assertEqual(self.store.parked["uuid-work"], login_blob("work-2"))
+
+
 if __name__ == "__main__":
     unittest.main()
