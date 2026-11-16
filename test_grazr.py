@@ -4456,7 +4456,7 @@ class WrongLoginTest(unittest.TestCase):
 
         self.assertEqual(fetch.call_count, 1)
         self.assertEqual(
-            [name for name in os.listdir(self.accounts_dir) if not name.startswith(".")],
+            sorted(name for name in os.listdir(self.accounts_dir) if not name.startswith(".")),
             sorted(["uuid-work.json", "uuid-personal.json"]),
             "what grazr keeps of an answer is no account",
         )
