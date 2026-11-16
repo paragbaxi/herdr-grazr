@@ -14,10 +14,12 @@ import fcntl
 import getpass
 import json
 import os
+import platform
 import shlex
 import subprocess
 import sys
 import termios
+import time
 import tty
 from collections import namedtuple
 from datetime import datetime, timezone
@@ -33,10 +35,13 @@ import stores
 # threshold a parked account needs before going back for its week is worth a swap.
 # `reserve_daily` maps an account name to the points of its week its owner uses a
 # day elsewhere, held until the reset on top of its weekly threshold.
+# `alert_command` is run, detached, with a title and a text when grazr refuses
+# something nobody is watching it refuse; "" runs nothing.
 Config = namedtuple(
     "Config",
-    "thresholds accounts enabled dry_run account_thresholds return_margin reserve_daily",
-    defaults=({}, core.RETURN_MARGIN, {}),
+    "thresholds accounts enabled dry_run account_thresholds return_margin reserve_daily"
+    " alert_command",
+    defaults=({}, core.RETURN_MARGIN, {}, ""),
 )
 
 Runtime = namedtuple("Runtime", "paths store state_dir config")
@@ -58,6 +63,10 @@ ACCOUNTS=""
 
 ENABLED=1
 DRY_RUN=0                # 1 = log the decision, do not swap
+
+# Run with a title and a text when grazr refuses to save a login under the
+# wrong account's name, e.g. ALERT_COMMAND="notify-send".
+# ALERT_COMMAND=""
 """
 
 _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("weekly", 10)}
@@ -78,6 +87,11 @@ _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False))
 RETURN_MARGIN_CEILING = 50
 
 LOG = "grazr.log"
+# When each refusal to save a login under the wrong name was last reported, by
+# the pair of accounts, so a standing one is reported once a day and not on every
+# message of every pane.
+WRONG_LOGIN_FILE = "wrong-login.json"
+WRONG_LOGIN_AGAIN_SECONDS = 24 * 60 * 60
 PREVIOUS_STATUSLINE = "statusline.previous.json"
 UNREADABLE_PENDING = "statusline.unreadable.json"
 # Only a live session can miss twice, so the armed set never needs to be large.
@@ -507,6 +521,11 @@ def load_config(path):
     )
     flags = [_flag(settings.pop(key, None), key, default) for key, default in _FLAG_KEYS]
     accounts = shlex.split(settings.pop("ACCOUNTS", "") or "")
+    alert_command = settings.pop("ALERT_COMMAND", "") or ""
+    try:
+        shlex.split(alert_command)
+    except ValueError as error:
+        raise ValueError("ALERT_COMMAND will not split into a command: %s" % error)
     if len(set(accounts)) != len(accounts):
         raise ValueError("ACCOUNTS lists the same account twice: %s" % " ".join(accounts))
 
@@ -541,6 +560,7 @@ def load_config(path):
         account_thresholds=account_thresholds,
         return_margin=return_margin,
         reserve_daily=reserve_daily,
+        alert_command=alert_command,
     )
 
 
@@ -734,7 +754,10 @@ def _keep_parked_current(runtime):
                 return
             if claude._digest(claude._parkable(live)) != digest:
                 return
+            claude.check_owner(paths, store, live, active)
             store.write_parked(active, claude._parkable(live))
+    except claude.WrongLogin as refusal:
+        _report_wrong_login(runtime, refusal)
     except (OSError, ValueError, RuntimeError):
         pass
 
@@ -880,6 +903,12 @@ def decide(runtime=None):
                 decision = ("override", override)
         try:
             line = act_on(decision, runtime, active, limits, enrolled, now)
+        except claude.WrongLogin as refusal:
+            # Standing until the config or the login changes: reported once a
+            # day, not on every message.
+            _report_wrong_login(runtime, refusal, now)
+            line = None
+            decision = "stay"
         except RuntimeError as refusal:
             # A busy Claude lock. The next message brings the next try.
             line = "Not rotating: %s" % refusal
@@ -960,6 +989,66 @@ def _left_behind(limits, active, enrolled, unproven=False):
         ):
             return True
     return False
+
+
+def _host():
+    """This machine's name, as its owner would know it from the log or a message."""
+    return platform.node() or "this machine"
+
+
+def _report_wrong_login(runtime, refusal, now=None):
+    """Say in grazr.log, and through ALERT_COMMAND, that a login was not saved
+    under the wrong account's name: the machine and both accounts, never a token.
+    Once a day for the same pair, since the refusal stands until Claude's config
+    or its login changes, and every message of every pane meets it."""
+    state_dir, config = runtime.state_dir, runtime.config
+    now = now or datetime.now(timezone.utc)
+    key = "%s %s" % (refusal.saving_as, refusal.holder)
+    path = os.path.join(state_dir, WRONG_LOGIN_FILE)
+    with _file_lock(path + ".lock", wait=True):
+        try:
+            with open(path) as handle:
+                told = json.load(handle)
+            if not isinstance(told, dict):
+                told = {}
+        except (OSError, ValueError):
+            told = {}
+        at = time.time()
+        told = {
+            pair: when for pair, when in told.items()
+            if isinstance(when, (int, float)) and at - when < WRONG_LOGIN_AGAIN_SECONDS
+        }
+        if key in told:
+            return False
+        told[key] = at
+        atomic.write(path, json.dumps(told))
+    host = _host()
+    _log(state_dir, now, "On %s, %s" % (host, refusal))
+    if config.alert_command:
+        title = "grazr on %s won't save %s's login as %s" % (host, refusal.holder_name, refusal.saving_name)
+        text = (
+            "On %s, %s. grazr left %s's saved login as it was, and won't rotate there "
+            "until Claude's config and its login name the same account again, as a "
+            "/login there does."
+            % (host, refusal, refusal.saving_name)
+        )
+        argv = shlex.split(config.alert_command)
+        argv[0] = os.path.expanduser(argv[0])
+        _run_alert(argv + [title, text], state_dir)
+    return True
+
+
+def _run_alert(argv, state_dir):
+    """Detached, like the decision: a command that reaches another machine must
+    not hold up the status line or the rotation lock. What it prints goes to the
+    log, where a failing command can be seen."""
+    with open(os.path.join(state_dir, LOG), "a") as log:
+        try:
+            subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+            )
+        except OSError as error:
+            log.write("ALERT_COMMAND could not run: %s\n" % error)
 
 
 def _log(state_dir, now, line):
@@ -1141,6 +1230,9 @@ def swap(runtime=None, target=None):
         decision = ("rotate", next_id)
         try:
             line = act_on(decision, runtime, active, limits, enrolled, now)
+        except claude.WrongLogin as refusal:
+            _report_wrong_login(runtime, refusal, now)
+            return _refuse_swap(str(refusal))
         except RuntimeError as refusal:
             return _refuse_swap(str(refusal))
         print(line)

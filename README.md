@@ -65,7 +65,10 @@ sits in that command. It passes the payload on to the status line you had,
 shows that line unchanged, and keeps the reading. When a threshold is crossed,
 a separate process makes the swap. Claude cancels the status-line command when
 the next update arrives, and a swap must never be caught half done by that.
-*grazr* polls nothing and calls no endpoint of its own.
+*grazr* polls nothing. The one request it makes of its own is Anthropic's
+profile, the one Claude makes at sign-in, sent with a login's own unexpired
+token before it saves that login under an account's name, once per token. See
+[One login, one name](#one-login-one-name).
 
 *grazr* keeps parked credentials where Claude keeps the live one. On macOS that
 is the keychain, and no secret ever touches the disk. On Linux there is no
@@ -116,6 +119,7 @@ RETURN_MARGIN=10         # points above its threshold a parked week needs to go 
 ACCOUNTS="work personal" # preference order, first with headroom wins
 ENABLED=1
 DRY_RUN=0                # 1 = log the decision, do not swap
+ALERT_COMMAND=""         # run with a title and a text when grazr refuses a login
 ```
 
 *grazr* never moves back to an account just because it recovered. The one
@@ -396,7 +400,38 @@ herdr plugin action invoke wazum.grazr.tag
 A pane you have scrolled up in keeps its old tag until you scroll back down,
 because repainting one can jump it to the bottom.
 
+### One login, one name
+
+Claude's config says which account it is on, and the login is a separate file
+or keychain item. Something outside *grazr* can change the first and leave the
+second: the config then names one account while the login is another's, and
+the next swap would park that login under the wrong name and lose the right
+one until you sign in again by browser.
+
+So before *grazr* saves a login under an account's name, at a swap, while
+keeping the parked copy current, or at enrolment, it asks Anthropic whose login
+it is, with that login's own token. A token that has expired is never sent and
+never refreshed. Offline, a login that is the very one *grazr* keeps for another
+account still gives it away. If the login is another account's, *grazr* saves
+nothing and does not swap, and says so in `grazr.log`, naming the machine and
+both accounts, once a day for as long as it stands. When neither tells,
+*grazr* saves the login as before. It never writes a token anywhere but the
+store: the one answer it keeps is the account, against a digest of the login.
+
+`ALERT_COMMAND` runs as well, detached, with a title and a text as its last
+two arguments, for when nobody is watching the log:
+
+```sh
+ALERT_COMMAND="notify-send"
+```
+
+A `/login` in Claude, as either account, brings the config and the login back
+in step.
+
 ## What it will not do
+
+- Save one account's login under another's name. See
+  [One login, one name](#one-login-one-name).
 
 - Act on a reading from an account it has left. A session keeps reporting the
   old account until its next request, and *grazr* tells those readings apart by

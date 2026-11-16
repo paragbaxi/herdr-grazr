@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import time
+import urllib.request
 from collections import namedtuple
 from datetime import datetime, timezone
 
@@ -40,6 +41,39 @@ ACCOUNT_SCOPED_CONFIG_KEYS = (
     "additionalModelCostsCache",
     "additionalModelOptionsCache",
 )
+
+# Whose login a token is: the request Claude makes at sign-in to fill in
+# `oauthAccount`, sent with that login's own access token and nothing else.
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+PROFILE_TIMEOUT_SECONDS = 5
+
+# Each answer is kept against a digest of the login it was asked for, so a login
+# is asked about once however many messages see it. Dot-named, so it is no account.
+OWNERS_FILE = ".owners.json"
+OWNERS_KEPT = 32
+
+
+class WrongLogin(RuntimeError):
+    """A login about to be saved under one account's name is another's.
+
+    Claude's config names the account it is on, and something outside grazr can
+    change that name while the login stays (2026-11-15, on the Mac: the config
+    said ghee22 while demo's login was live, and the next rotations parked demo's
+    login as ghee22, losing ghee22's own until a browser sign-in). Only the
+    token says whose login it is."""
+
+    def __init__(self, saving_as, saving_name, holder, holder_name, how):
+        self.saving_as = saving_as
+        self.saving_name = saving_name
+        self.holder = holder
+        self.holder_name = holder_name
+        self.how = how
+        super().__init__(
+            "the login Claude is signed in with is %s's, not %s's (%s), so grazr "
+            "won't save it as %s. Claude's config names %s, so something outside "
+            "grazr changed the account it names"
+            % (holder_name, saving_name, how, saving_name, saving_name)
+        )
 
 
 @contextlib.contextmanager
@@ -163,6 +197,7 @@ def enrol(paths, store, name, source_config_dir=None):
     for existing in accounts.load(paths, []):
         if existing.name == name and existing.id != account_id:
             raise RuntimeError("The name %r is already used by another account" % name)
+    check_owner(paths, store, blob, account_id, name)
 
     store.write_parked(account_id, _parkable(blob))
     accounts.write(
@@ -209,6 +244,9 @@ def rotate(paths, store, active_id, next_id, snapshot):
     if arriving is None:
         raise RuntimeError("No parked credential for %s. Enrol it again" % next_id)
     identity = accounts.read(paths, next_id)["oauthAccount"]
+    # Anthropic is asked before Claude's locks are taken, so they are never held
+    # for a network round trip. The check under them finds the answer kept.
+    _asked_owner(paths, store.read_live())
 
     # Both locks before the first write. The identity write comes last, but its
     # lock can be busy too, and refusing after the credential moved is the whole
@@ -227,6 +265,8 @@ def rotate(paths, store, active_id, next_id, snapshot):
         renew()
         pending = _pending_swap(paths, store, active_id, leaving)
         if pending is None:
+            check_owner(paths, store, leaving, active_id)
+            renew()
             parking = _parkable(leaving)
             # The marker goes first, so a retry can tell how far this got.
             _write_swap_marker(paths, active_id, next_id, parking)
@@ -280,6 +320,114 @@ def _epoch_milliseconds(value):
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     return value
+
+
+def fetch_profile(access_token):
+    """Anthropic's profile of the login `access_token` belongs to. Raises OSError
+    or ValueError when there is no answer. The token goes in the Authorization
+    header to Anthropic and nowhere else, and nothing here prints it."""
+    request = urllib.request.Request(
+        PROFILE_URL,
+        headers={"Authorization": "Bearer " + access_token, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=PROFILE_TIMEOUT_SECONDS) as answer:
+        return json.load(answer)
+
+
+def signed_in_as(blob):
+    """The account a login belongs to, as {"id", "email"}, or None when that
+    cannot be told: no token, one that has expired, or no answer. An expired
+    token is never refreshed here: a refresh replaces the refresh token Claude
+    holds, which signs Claude out."""
+    try:
+        oauth = json.loads(blob)["claudeAiOauth"]
+        token = oauth["accessToken"]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not isinstance(token, str) or not token:
+        return None
+    expires_at = _epoch_milliseconds(oauth.get("expiresAt"))
+    if expires_at is not None and expires_at <= time.time() * 1000:
+        return None
+    try:
+        account = fetch_profile(token)["account"]
+        found = account["uuid"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(found, str) or not found:
+        return None
+    email = account.get("email")
+    return {"id": found.lower(), "email": email if isinstance(email, str) else None}
+
+
+def _asked_owner(paths, blob):
+    """signed_in_as, asked once per login: the answer is kept against a digest of
+    the login, never the login itself. None when it cannot be told."""
+    if blob is None:
+        return None
+    digest = _digest(_parkable(blob))
+    path = os.path.join(paths.accounts_dir, OWNERS_FILE)
+    try:
+        with open(path) as handle:
+            known = json.load(handle)
+        if not isinstance(known, dict):
+            known = {}
+    except (OSError, ValueError):
+        known = {}
+    if isinstance(known.get(digest), dict) and known[digest].get("id"):
+        return known[digest]
+    found = signed_in_as(blob)
+    if found is None:
+        return None
+    known.pop(digest, None)
+    known[digest] = found
+    while len(known) > OWNERS_KEPT:
+        known.pop(next(iter(known)))
+    try:
+        atomic.write(path, json.dumps(known))
+    except OSError:
+        pass
+    return found
+
+
+def check_owner(paths, store, blob, account_id, saving_name=None):
+    """Raise WrongLogin when `blob` is known to be another account's login.
+
+    Anthropic's answer decides when there is one. Without it, the login being
+    the very one grazr keeps for another account decides: that is the swap
+    replayed after Claude's config changed account under it. When neither tells,
+    the login is saved as before, since refusing would strand a pane on an
+    account that has run out."""
+    enrolled = {entry.id: entry.name for entry in accounts.load(paths, [])}
+    owner = _asked_owner(paths, blob)
+    if owner is not None:
+        holder, how = owner["id"], "Anthropic says so"
+        holder_name = enrolled.get(holder) or owner.get("email") or "an account not enrolled here"
+    else:
+        same = [
+            identifier
+            for identifier in enrolled
+            if _parked_same_login(store, identifier, blob)
+        ]
+        if account_id in same or len(same) != 1:
+            return
+        holder = same[0]
+        holder_name = enrolled[holder]
+        how = "it is the login grazr keeps for %s" % holder_name
+    if holder == account_id:
+        return
+    raise WrongLogin(
+        saving_as=account_id,
+        saving_name=saving_name or enrolled.get(account_id) or account_id,
+        holder=holder,
+        holder_name=holder_name,
+        how=how,
+    )
+
+
+def _parked_same_login(store, identifier, blob):
+    parked = store.read_parked(identifier)
+    return parked is not None and _same_login(blob, parked)
 
 
 def settings_auth_override(config_dir):

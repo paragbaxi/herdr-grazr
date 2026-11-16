@@ -4483,9 +4483,11 @@ class WrongLoginTest(unittest.TestCase):
         self.assertEqual(refused.exception.holder_name, "s@example.com")
 
     def test_enrolment_refuses_a_login_that_is_not_the_configs_account(self):
-        with mock.patch.object(claude, "fetch_profile", return_value=profile("uuid-personal")):
+        with open(self.config_path, "w") as handle:
+            json.dump({"oauthAccount": {"accountUuid": EnrolTest.WORK}}, handle)
+        with mock.patch.object(claude, "fetch_profile", return_value=profile(EnrolTest.PERSONAL)):
             with self.assertRaises(claude.WrongLogin):
-                claude.enrol(self.paths, self.store, "work")
+                claude.enrol(self.paths, self.store, "work2")
 
         self.assertEqual(self.store.events, [])
 

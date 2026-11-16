@@ -32,8 +32,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   next reading, refused by name. A tool that reads every machine knows of use
   one machine's old snapshot cannot show. It holds however old the file is,
   up to a week and a day after it was written.
+- `ALERT_COMMAND` runs, detached, with a title and a text, when *grazr* refuses
+  to save a login under the wrong account's name.
 
 ### Fixed
+
+- A login is never saved under another account's name. When Claude's config
+  named one account while another's login was live, a swap or the parked copy
+  kept current saved that login under the config's name, and the account's own
+  login was lost until a browser sign-in. *grazr* now asks Anthropic whose login
+  it is, with that login's own unexpired token, once per token, and refuses
+  when it is another's, or, offline, when it is the very one *grazr* keeps for
+  another account. It says so in `grazr.log`, naming the machine and both
+  accounts.
 
 - The parked copy of the account you're on is kept current as Claude refreshes
   its token. Each refresh replaces the refresh token, so a login made outside
