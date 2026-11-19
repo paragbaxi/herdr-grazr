@@ -8,6 +8,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `RETURN_MARGIN=off` never goes back for a week that ends sooner: grazr then
+  moves only off an account below its thresholds. It is for a fleet whose
+  accounts another tool places, where a second mover would undo the first.
+  `status` says so.
+
 - A limit reset that puts an account's week back to full early (Settings >
   Usage, "Limit resets") now shows. It leaves the week's reset time alone, so
   the record kept the week's lowest figure and the week looked spent until it

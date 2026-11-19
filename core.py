@@ -261,7 +261,10 @@ def expiring_sooner(limits, active, accounts, now, thresholds, per_account=None,
     fires only when the active week has just reset or the other account's
     week is in its last day, and only when enough is left there to be worth
     two swaps. A lightly used week reads as fresh for days, so the floor
-    applies to both."""
+    applies to both. A `return_margin` of None never goes back: another tool
+    places the account, and grazr moves only off one below its thresholds."""
+    if return_margin is None:
+        return None
     weeks = [limit for limit in limits if limit.group == "weekly" and limit.resets_at and limit.resets_at > now]
     if not weeks:
         return None

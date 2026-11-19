@@ -241,6 +241,24 @@ class ExpiringSoonerTest(unittest.TestCase):
             ("rotate", "sooner"),
         )
 
+    def test_with_the_margin_off_an_account_above_its_floor_never_moves(self):
+        """Where another tool places each machine's account, grazr moves only
+        off one below its thresholds: a second mover would undo the first.
+        Neither a fresh week nor another's last day moves it."""
+        in_use = [limit(group="weekly", remaining=41, resets_at=NOW + timedelta(days=3))]
+        for active, sooner in ((self.fresh_week(), self.ending_in(2)), (in_use, self.ending_in(0.25, remaining=90))):
+            with self.subTest(active=active):
+                self.assertEqual(
+                    decide(active, "work", [sooner], now=NOW, thresholds=THRESHOLDS, return_margin=None),
+                    "stay",
+                )
+                self.assertIsNone(core.expiring_sooner(active, "work", [sooner], NOW, THRESHOLDS, return_margin=None))
+        low = [limit(group="weekly", remaining=5, resets_at=NOW + timedelta(days=3))]
+        self.assertEqual(
+            decide(low, "work", [self.ending_in(2)], now=NOW, thresholds=THRESHOLDS, return_margin=None),
+            ("rotate", "sooner"),
+        )
+
     def test_a_fresh_week_does_not_hand_over_for_crumbs_either(self):
         """A lightly used week reads as fresh for days, and a handover for a
         few points then costs two swaps for nearly nothing."""
@@ -2089,6 +2107,15 @@ class ConfigTest(unittest.TestCase):
         self.write('ACCOUNTS="work"\nRETURN_MARGIN=2\n')
         self.assertEqual(grazr.load_config(self.path).return_margin, 2)
 
+    def test_the_return_margin_can_be_off(self):
+        self.write('ACCOUNTS="work"\nRETURN_MARGIN=off\n')
+        self.assertIsNone(grazr.load_config(self.path).return_margin)
+        for value in ("Off", "none", "0ff"):
+            with self.subTest(value=value):
+                self.write('ACCOUNTS="work"\nRETURN_MARGIN=%s\n' % value)
+                with self.assertRaises(ValueError):
+                    grazr.load_config(self.path)
+
     def test_a_return_margin_outside_nought_to_fifty_is_rejected_by_name(self):
         for value in ("51", "-1", "two", ""):
             with self.subTest(value=value):
@@ -3215,6 +3242,14 @@ class StatuslineTest(EnrolledPairFixture):
 
         self.assertIn("This login is not enrolled, so only a swap by hand moves off it", printed)
 
+    def test_the_status_screen_says_the_return_margin_is_off(self):
+        self.write_config('ACCOUNTS="work personal"\nRETURN_MARGIN=off\n')
+
+        with mock.patch.object(grazr, "read_key", lambda: "q"):
+            _, printed = self.invoke(grazr.status)
+
+        self.assertIn("return margin off", printed)
+
     def test_the_status_screen_shows_thresholds_an_account_sets_for_itself(self):
         """Only where they differ from the global ones, which head the screen."""
         self.write_config('ACCOUNTS="work personal"\nREMAINING_WEEKLY_personal=5\n')
@@ -3332,6 +3367,13 @@ class StatuslineTest(EnrolledPairFixture):
         self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
         with open(os.path.join(self.state_dir, "grazr.log")) as handle:
             self.assertIn("Rotated work -> personal, its week ends sooner", handle.read())
+
+    def test_with_the_margin_off_the_status_line_never_goes_back(self):
+        """What a small margin goes back for, off leaves: another tool places
+        the account."""
+        self.go_back_for_a_leftover('ACCOUNTS="work personal"\nRETURN_MARGIN=off\n')
+
+        self.assertEqual(self.rotations, [])
 
     def test_the_default_return_margin_leaves_three_points_to_expire(self):
         self.go_back_for_a_leftover('ACCOUNTS="work personal"\n')
