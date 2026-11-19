@@ -11,11 +11,15 @@ jobs:
     # The suite is hermetic (no keychain, no network, no `claude`), so it runs
     # the same on both platforms and a failure on either OS is a real bug
     # rather than a missing dependency.
+    #
+    # macOS runs on Intel: GitHub's arm64 macOS runners are short, and about
+    # one job in three sat 15 minutes unclaimed and was cancelled (Nov 2026).
+    # The suite is pure Python, so the chip does not change what it tests.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-15-intel, ubuntu-latest]
         # 3.9 is the documented floor and catches syntax the README forbids
         # (no `X | None`); the newest release catches deprecations early.
         python: ["3.9", "3.13"]
