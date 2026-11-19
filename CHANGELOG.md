@@ -33,13 +33,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `RETURN_MARGIN` sets the ten points a parked week needs above its threshold
   before grazr goes back for it. Lower it to spend leftovers that would expire
   at a weekly reset, at the price of more swaps. The fallback keeps its ten.
-- `RESERVE_DAILY_<name>` holds what you use of an account a day, elsewhere,
-  for each day left until its week resets, on top of its weekly threshold. It
-  ends in the last hour of the week, so it is spent rather than expiring
-  unused. Your use since a parked account's last reading is held too, so an
-  old reading never looks better than the account is. A fresh figure in
-  `reserve.json` in the state directory, from a tool that measures your use,
-  replaces the setting.
+- `"keep": {"<name>": {"left": <points>, "until": <unix seconds>}}` in
+  `reserve.json` holds what another tool says an account keeps this week, on
+  top of its own thresholds: *grazr* moves off it at `left` and never picks it
+  there or below. The figure holds until `until`, however old the file is.
+  *grazr* works out no reserve of its own: `RESERVE_DAILY_<name>`, which held
+  your use a day here, is read and ignored, and a `reserve.json` with no
+  `keep` that names an account under `daily` keeps it off.
 - An account's own thresholds hold to the very end of its week: they are the
   buffer kept for you.
 - `"at_reserve": {"<name>": <unix seconds>}` in `reserve.json` keeps an

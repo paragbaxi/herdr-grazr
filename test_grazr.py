@@ -1,3 +1,4 @@
+import ast
 import contextlib
 import fcntl
 import hashlib
@@ -2043,27 +2044,19 @@ class ConfigTest(unittest.TestCase):
         self.write('ACCOUNTS="work personal"\n')
 
         self.assertEqual(grazr.load_config(self.path).account_thresholds, {})
-        self.assertEqual(grazr.load_config(self.path).reserve_daily, {})
 
-    def test_an_account_can_hold_what_its_owner_uses_a_day(self):
-        self.write('ACCOUNTS="demo qa ghee22"\nREMAINING_WEEKLY_ghee22=6\nRESERVE_DAILY_ghee22=10\n')
+    def test_a_daily_reserve_is_retired_and_still_loads(self):
+        """What an account keeps comes from RESERVE_FILE now. An older
+        config.env with the setting must still load, or grazr would rotate
+        nothing until it was rewritten."""
+        for text in ("RESERVE_DAILY_ghee22=10\n", "RESERVE_DAILY_gone=7.5\n"):
+            with self.subTest(text=text):
+                self.write('ACCOUNTS="demo qa ghee22"\nREMAINING_WEEKLY_ghee22=6\n' + text)
 
-        config = grazr.load_config(self.path)
+                config = grazr.load_config(self.path)
 
-        self.assertEqual(config.reserve_daily, {"ghee22": 10})
-        self.assertEqual(config.account_thresholds, {"ghee22": {"weekly": 6}})
-
-    def test_a_daily_reserve_for_an_account_not_in_accounts_is_refused(self):
-        self.write('ACCOUNTS="demo qa"\nRESERVE_DAILY_ghee22=10\n')
-
-        with self.assertRaisesRegex(ValueError, "RESERVE_DAILY_ghee22.*not in ACCOUNTS"):
-            grazr.load_config(self.path)
-
-    def test_a_daily_reserve_must_be_a_whole_percent(self):
-        self.write('ACCOUNTS="ghee22"\nRESERVE_DAILY_ghee22=7.5\n')
-
-        with self.assertRaisesRegex(ValueError, "RESERVE_DAILY_ghee22 must be a whole percent"):
-            grazr.load_config(self.path)
+                self.assertEqual(config.account_thresholds, {"ghee22": {"weekly": 6}})
+                self.assertFalse(hasattr(config, "reserve_daily"))
 
     def test_an_account_name_with_a_dot_or_a_dash_is_written_as_it_is(self):
         self.write(
@@ -2929,10 +2922,9 @@ class SwapTest(EnrolledPairFixture):
         self.assertIn("Rotated work -> spare", printed)
         self.assertEqual(self.tags, ["spare"])
 
-    def reserve_on_personal(self, minutes, remaining=5, daily="", read_hours_ago=0):
+    def reserve_on_personal(self, minutes, remaining=5, read_hours_ago=0, extra=""):
         self.write_config(
-            'REMAINING_WEEKLY=2\nACCOUNTS="work personal"\nREMAINING_WEEKLY_personal=6\n'
-            + ("RESERVE_DAILY_personal=%s\n" % daily if daily else "")
+            'REMAINING_WEEKLY=2\nACCOUNTS="work personal"\nREMAINING_WEEKLY_personal=6\n' + extra
         )
         resets = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).replace(microsecond=0)
         path = os.path.join(self.state_dir, "accounts", "uuid-personal.json")
@@ -2949,12 +2941,16 @@ class SwapTest(EnrolledPairFixture):
                 f,
             )
         stamp(path, read_hours_ago)
+        return resets
 
-    def measure_personal(self, daily, hours_ago=0):
+    def tell_personal(self, told, hours_ago=0):
         path = os.path.join(self.state_dir, grazr.RESERVE_FILE)
         with open(path, "w") as f:
-            json.dump({"daily": {"personal": daily}}, f)
+            json.dump(told, f)
         stamp(path, hours_ago)
+
+    def keeps(self, left, until):
+        self.tell_personal({"keep": {"personal": {"left": left, "until": until.timestamp()}}, "at_reserve": {}})
 
     def assert_refused(self):
         code, printed = self.swap_to("personal")
@@ -2976,39 +2972,69 @@ class SwapTest(EnrolledPairFixture):
         self.reserve_on_personal(minutes=30)
         self.assert_refused()
 
-    def test_what_its_owner_uses_a_day_until_the_reset_is_held_too(self):
-        # 10 a day for 10 hours is 5 points on top of the 6.
-        self.reserve_on_personal(minutes=600, remaining=10, daily="10")
+    def test_what_the_file_says_it_keeps_is_held_as_given(self):
+        """herdtask works out what it keeps; grazr adds nothing and takes
+        nothing off: no room at what it keeps, room one point above."""
+        resets = self.reserve_on_personal(minutes=600, remaining=27)
+        self.keeps(27, resets)
         self.assert_refused()
-
-    def test_with_room_above_both_it_is_taken(self):
-        self.reserve_on_personal(minutes=600, remaining=11, daily="10")
+        self.rotations.clear()
+        resets = self.reserve_on_personal(minutes=600, remaining=28)
+        self.keeps(27, resets)
         self.assert_swapped()
 
-    def test_the_daily_part_is_free_to_spend_in_the_weeks_last_hour(self):
-        self.reserve_on_personal(minutes=30, remaining=6, daily="10")
-        self.assert_swapped()
-
-    def test_his_use_since_an_old_snapshot_is_held(self):
-        """A parked account's snapshot is as old as the last turn on it, and
-        his own use has gone on since."""
-        self.reserve_on_personal(minutes=30, remaining=10, daily="10", read_hours_ago=12)
+    def test_its_own_threshold_stays_the_floor(self):
+        resets = self.reserve_on_personal(minutes=600, remaining=5)
+        self.keeps(3, resets)
         self.assert_refused()
 
-    def test_a_fresh_measure_replaces_the_setting(self):
-        # 30 a day for 2 hours is 3 points on top of the 6: 8 left is short.
-        self.reserve_on_personal(minutes=120, remaining=8, daily="10")
-        self.measure_personal(30)
+    def test_an_old_file_still_holds_until_the_week_ends(self):
+        """What it keeps only falls within a week, so an old figure holds
+        more, never less: it stands if the tool stops writing."""
+        resets = self.reserve_on_personal(minutes=600, remaining=27)
+        self.keeps(27, resets)
+        stamp(os.path.join(self.state_dir, grazr.RESERVE_FILE), 30)
         self.assert_refused()
 
-    def test_a_stale_measure_is_ignored(self):
-        self.reserve_on_personal(minutes=120, remaining=8, daily="10")
-        self.measure_personal(30, hours_ago=3)
+    def test_past_its_week_only_its_own_threshold_holds(self):
+        """The tool says nothing of a week no one has read, which has the
+        room: steering takes it as free, so grazr must too, or no machine
+        would ever read it again."""
+        self.reserve_on_personal(minutes=6000, remaining=90)
+        self.keeps(27, datetime.now(timezone.utc) - timedelta(minutes=1))
         self.assert_swapped()
 
-    def test_a_measure_holds_nothing_without_a_setting(self):
+    def test_one_named_in_a_form_grazr_cannot_read_is_kept_off(self):
+        self.reserve_on_personal(minutes=6000, remaining=90)
+        for told in ({"personal": {"left": "27", "until": 1}}, {"personal": 27}, {"personal": {"left": 27}}):
+            with self.subTest(told=told):
+                self.tell_personal({"keep": told})
+                self.assert_refused()
+
+    def test_an_older_tools_daily_rate_keeps_it_off(self):
+        """A file with a rate and no `keep` for it comes from a tool that still
+        expects grazr to work the reserve out. It no longer does, so the
+        account it names is kept off rather than held only at its floor."""
+        self.reserve_on_personal(minutes=6000, remaining=90)
+        self.tell_personal({"daily": {"personal": 10}, "at_reserve": {}})
+        self.assert_refused()
+
+    def test_a_rate_beside_keep_holds_nothing(self):
+        """A file with `keep` says what each account keeps; one it leaves out
+        keeps nothing more than its own threshold, whatever rate it names."""
+        self.reserve_on_personal(minutes=6000, remaining=90)
+        for told in ({"daily": {"personal": 10}, "keep": {}}, {"daily": {"personal": 10}, "keep": None}):
+            with self.subTest(told=told):
+                self.tell_personal(told)
+                self.assert_swapped()
+                self.rotations.clear()
+
+    def test_with_no_file_only_its_own_threshold_holds(self):
         self.reserve_on_personal(minutes=600, remaining=7)
-        self.measure_personal(30)
+        self.assert_swapped()
+
+    def test_a_retired_daily_setting_holds_nothing(self):
+        self.reserve_on_personal(minutes=600, remaining=7, extra="RESERVE_DAILY_personal=10\n")
         self.assert_swapped()
 
     def keep_off_personal(self, until_hours, hours_ago=0):
@@ -4345,24 +4371,11 @@ class FitnessTest(unittest.TestCase):
             self.assertNotIn(', "w")', source.read())
 
 
-class ReserveEndsWithTheWeekTest(unittest.TestCase):
+class KeepTest(unittest.TestCase):
     NOW = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
 
     def week(self, remaining, hours):
         return [core.Limit("weekly_all", "all", "weekly", remaining, self.NOW + timedelta(hours=hours))]
-
-    def test_kept_until_the_last_hour(self):
-        self.assertFalse(core.reserve_ended(self.week(5, 1.01), self.NOW))
-        self.assertTrue(core.reserve_ended(self.week(5, 1), self.NOW))
-
-    def test_a_week_that_has_ended_or_no_reading_says_nothing(self):
-        self.assertFalse(core.reserve_ended(self.week(5, -1), self.NOW))
-        self.assertFalse(core.reserve_ended(None, self.NOW))
-        self.assertFalse(core.reserve_ended([], self.NOW))
-
-    def test_a_model_limit_does_not_end_it(self):
-        limits = [core.Limit("weekly_opus", "opus", "weekly", 5, self.NOW + timedelta(minutes=30))]
-        self.assertFalse(core.reserve_ended(limits, self.NOW))
 
     THRESHOLDS = {"session": 5, "weekly": 2}
 
@@ -4374,52 +4387,58 @@ class ReserveEndsWithTheWeekTest(unittest.TestCase):
         config = self.config({"weekly": 6, "session": 6})
         chat = core.Account("id-chat", "chat", self.week(5, 0.5))
         work = core.Account("id-work", "work", self.week(50, 100))
-        per_account = grazr._per_account(config, [work, chat], self.NOW)
+        per_account = grazr._per_account(config, [work, chat])
         self.assertEqual(per_account, {"id-chat": {"weekly": 6, "session": 6}})
         self.assertIsNone(core.next_account("id-work", [work, chat], self.NOW, self.THRESHOLDS, per_account))
         self.assertEqual(core.decide(chat.snapshot, "id-chat", [work, chat], self.NOW, self.THRESHOLDS, per_account), ("rotate", "id-work"))
 
-    def test_it_holds_before_then(self):
-        chat = core.Account("id-chat", "chat", self.week(5, 2))
-        self.assertEqual(grazr._per_account(self.config({"weekly": 6}), [chat], self.NOW), {"id-chat": {"weekly": 6}})
-
-    def test_the_rule(self):
-        """10 a day for 2.2 days, and the buffer of 5: grazr moves off below
-        28, at 27 left, which herdtask's pace calls "keeps 27"."""
-        self.assertEqual(core.held_daily(self.week(50, 2.2 * 24), self.NOW, 10), 22)
+    def test_what_it_keeps_is_the_floor_less_one(self):
+        """herdtask's pace says "keeps 27": grazr moves off at 27 left and
+        never picks it below 28."""
         chat = core.Account("id-chat", "chat", self.week(50, 2.2 * 24))
-        held = grazr._per_account(self.config({"weekly": 6}), [chat], self.NOW, {"id-chat": (10, self.NOW)})
+        held = grazr._per_account(self.config({"weekly": 6}), [chat], {"id-chat": 27})
         self.assertEqual(held, {"id-chat": {"weekly": 28}})
+        self.assertFalse(core._has_headroom(self.week(27, 30), self.NOW, held["id-chat"]))
+        self.assertTrue(core._has_headroom(self.week(28, 30), self.NOW, held["id-chat"]))
 
-    def test_what_is_held_shrinks_as_the_reset_nears(self):
-        self.assertEqual(core.held_daily(self.week(50, 24), self.NOW, 10), 10)
-        self.assertEqual(core.held_daily(self.week(50, 12), self.NOW, 10), 5)
-        self.assertEqual(core.held_daily(self.week(50, 1.5), self.NOW, 10), 1)
-
-    def test_only_the_buffer_is_held_in_the_last_hour(self):
-        self.assertEqual(core.held_daily(self.week(50, 1), self.NOW, 10), 0)
+    def test_its_own_threshold_stays_when_it_keeps_less(self):
         chat = core.Account("id-chat", "chat", self.week(50, 0.5))
-        held = grazr._per_account(self.config({"weekly": 6}), [chat], self.NOW, {"id-chat": (10, self.NOW)})
-        self.assertEqual(held, {"id-chat": {"weekly": 6}})
+        self.assertEqual(grazr._per_account(self.config({"weekly": 6}), [chat], {"id-chat": 3}), {"id-chat": {"weekly": 6}})
 
-    def test_his_use_since_the_snapshot_is_held_too(self):
-        week = self.week(50, 0.5)
-        self.assertEqual(core.held_daily(week, self.NOW, 10, self.NOW - timedelta(hours=36)), 15)
-        self.assertEqual(core.held_daily(week, self.NOW, 10, self.NOW - timedelta(hours=2)), 0)
-
-    def test_without_a_live_week_nothing_is_held(self):
-        """A fresh week has the room, and one never read cannot be sized."""
-        self.assertEqual(core.held_daily(self.week(50, -1), self.NOW, 10), 0)
-        self.assertEqual(core.held_daily(None, self.NOW, 10), 0)
-        self.assertEqual(core.held_daily([], self.NOW, 10), 0)
-        limits = [core.Limit("weekly_opus", "opus", "weekly", 50, self.NOW + timedelta(hours=30))]
-        self.assertEqual(core.held_daily(limits, self.NOW, 10), 0)
-
-    def test_an_account_without_thresholds_of_its_own_adds_to_the_global_one(self):
+    def test_an_account_without_thresholds_of_its_own_is_held_to_what_it_keeps(self):
         config = SimpleNamespace(account_thresholds={}, thresholds=self.THRESHOLDS)
         chat = core.Account("id-chat", "chat", self.week(50, 24))
-        held = grazr._per_account(config, [chat], self.NOW, {"id-chat": (10, self.NOW)})
-        self.assertEqual(held, {"id-chat": {"weekly": 12}})
+        self.assertEqual(grazr._per_account(config, [chat], {"id-chat": 11}), {"id-chat": {"weekly": 12}})
+        self.assertEqual(grazr._per_account(config, [chat], {"id-chat": 0}), {"id-chat": {"weekly": 2}})
+
+    def test_keeping_all_of_it_keeps_it_off(self):
+        chat = core.Account("id-chat", "chat", self.week(100, 24))
+        held = grazr._per_account(self.config({"weekly": 6}), [chat], {"id-chat": 100})
+        self.assertEqual(held, {"id-chat": {"weekly": core.HELD_OFF}})
+
+    def test_grazr_works_out_no_reserve_of_its_own(self):
+        """What an account keeps for its owner is one figure, the other tool's
+        (tl-txjh): a second copy here once held only the floor while the tool
+        said nothing of it (tl-huvl). No sum in grazr involves a rate a day."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        for module in ("core.py", "grazr.py"):
+            with open(os.path.join(here, module)) as source:
+                tree = ast.parse(source.read())
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.BinOp, ast.AugAssign)) or not isinstance(
+                    node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)
+                ) or any(
+                    isinstance(side, ast.Constant) and isinstance(side.value, str)
+                    for side in ast.iter_child_nodes(node)
+                ):
+                    continue  # a sum, not a key put together
+                for name in ast.walk(node):
+                    word = name.id if isinstance(name, ast.Name) else name.attr if isinstance(name, ast.Attribute) else ""
+                    self.assertFalse(
+                        "daily" in word.lower() or word in ("rate", "per_day", "DAY_SECONDS"),
+                        "%s:%d sums with %s" % (module, node.lineno, word),
+                    )
+            self.assertNotIn("held_daily", open(os.path.join(here, module)).read())
 
     def test_one_kept_off_is_never_fit_and_never_kept(self):
         """herdtask keeps every machine off an account its readings put at its
@@ -4428,7 +4447,7 @@ class ReserveEndsWithTheWeekTest(unittest.TestCase):
         work = core.Account("id-work", "work", self.week(50, 100))
         for snapshot in (None, [], self.week(90, 30)):
             chat = core.Account("id-chat", "chat", snapshot)
-            per_account = grazr._per_account(config, [work, chat], self.NOW, held_off={"id-chat"})
+            per_account = grazr._per_account(config, [work, chat], held_off={"id-chat"})
             self.assertEqual(per_account, {"id-chat": {"weekly": core.HELD_OFF}})
             self.assertIsNone(core.next_account("id-work", [work, chat], self.NOW, self.THRESHOLDS, per_account))
             self.assertIsNone(core.expiring_sooner(work.snapshot, "id-work", [work, chat], self.NOW, self.THRESHOLDS, per_account))
@@ -4440,7 +4459,16 @@ class ReserveEndsWithTheWeekTest(unittest.TestCase):
         path = os.path.join(directory, grazr.RESERVE_FILE)
         with open(path, "w") as f:
             json.dump({
-                "daily": {"chat": 7.8, "bad": True},
+                "keep": {
+                    "chat": {"left": 26.2, "until": 1794528000},
+                    # Its week has ended: only its own thresholds hold.
+                    "done": {"left": 26, "until": 1794522600},
+                    # Not readable, or past any week: kept off.
+                    "bad": {"left": True, "until": 1794528000},
+                    "worse": {"left": 26, "until": 1794528000 + 9 * 24 * 3600},
+                    "worst": 26,
+                },
+                "daily": {"older": 7.8},
                 "at_reserve": {"chat": 1794528000, "bad": "soon", "worse": True},
                 # chat's week put back an hour before, work's 9 days before: too old.
                 "resets": {"chat": 1794522600, "work": 1793748600, "bad": "now"},
@@ -4448,8 +4476,8 @@ class ReserveEndsWithTheWeekTest(unittest.TestCase):
         written = datetime(2026, 11, 12, 23, 30, tzinfo=timezone.utc)
         os.utime(path, (written.timestamp(), written.timestamp()))
         reset = datetime(2026, 11, 13, tzinfo=timezone.utc)
-        daily, until, put_back = grazr._reserve_file(directory, written)
-        self.assertEqual(daily, {"chat": 7.8})
+        kept, until, put_back = grazr._reserve_file(directory, written)
+        self.assertEqual(kept, {"chat": 27, "bad": 100, "worse": 100, "worst": 100})
         self.assertEqual(until, {"chat": reset})
         self.assertEqual(put_back, {"chat": written - timedelta(hours=1)})
         chat = core.Account("id-chat", "chat", None)

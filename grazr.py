@@ -13,6 +13,7 @@ import contextlib
 import fcntl
 import getpass
 import json
+import math
 import os
 import platform
 import shlex
@@ -34,15 +35,12 @@ import stores
 # thresholds it sets for itself. `return_margin` is how many points above its
 # threshold a parked account needs before going back for its week is worth a swap;
 # None never goes back.
-# `reserve_daily` maps an account name to the points of its week its owner uses a
-# day elsewhere, held until the reset on top of its weekly threshold.
 # `alert_command` is run, detached, with a title and a text when grazr refuses
 # something nobody is watching it refuse; "" runs nothing.
 Config = namedtuple(
     "Config",
-    "thresholds accounts enabled dry_run account_thresholds return_margin reserve_daily"
-    " alert_command",
-    defaults=({}, core.RETURN_MARGIN, {}, ""),
+    "thresholds accounts enabled dry_run account_thresholds return_margin alert_command",
+    defaults=({}, core.RETURN_MARGIN, ""),
 )
 
 Runtime = namedtuple("Runtime", "paths store state_dir config")
@@ -53,8 +51,6 @@ REMAINING_SESSION=15     # the 5-hour window
 REMAINING_WEEKLY=10      # weekly windows, incl. per-model ones
 # One account can keep its own, e.g. a reserve on one you also chat on:
 # REMAINING_WEEKLY_personal=30
-# and hold what you use of it a day until its week resets:
-# RESERVE_DAILY_personal=10
 
 # Points above its threshold a parked week needs before going back for it,
 # or off: never go back (another tool places the accounts).
@@ -72,11 +68,20 @@ DRY_RUN=0                # 1 = log the decision, do not swap
 """
 
 _THRESHOLD_KEYS = {"REMAINING_SESSION": ("session", 15), "REMAINING_WEEKLY": ("weekly", 10)}
+# RESERVE_DAILY_<name> once held an owner's use a day, worked out here. Another tool
+# says what an account keeps now (`keep`, below), so the setting is read and
+# ignored: an older config.env still loads.
 RESERVE_DAILY = "RESERVE_DAILY"
-# Another tool that measures an owner's use can put its figure here, in the state
-# directory, as {"daily": {"<name>": points a day}}. It counts only for an account
-# with RESERVE_DAILY_<name>, and only while it is fresh: a tool that stopped
-# measuring must not leave a figure behind for good. With "at_reserve":
+# Another tool that knows what an account must keep for its owner says so here,
+# in the state directory, as {"keep": {"<name>": {"left": <points>, "until": <unix
+# seconds>}}}: grazr counts the account as having no room while it shows `left`
+# or less, and works out no reserve of its own. Within a week what an account
+# keeps only falls, so an old figure holds more, never less, and it holds however
+# old the file is, until `until`, its week's end. Then only the account's own
+# thresholds hold, as for one the file does not name: the tool says nothing of a
+# week no one has read, which has the room. An entry grazr cannot read keeps
+# its account off, and so does a file with no "keep" at all that names the
+# account under "daily": that tool left the reserve to grazr. With "at_reserve":
 # {"<name>": unix seconds} it keeps an enrolled account off until then, whatever
 # its snapshot here shows: a tool that reads every machine knows of use since.
 # That holds however old the file is, since it ends by itself, but only up to a
@@ -85,7 +90,6 @@ RESERVE_DAILY = "RESERVE_DAILY"
 # its owner used: from then the first figure of a session that has changed since
 # is the week's, whatever the record shows (see `_early_resets`).
 RESERVE_FILE = "reserve.json"
-RESERVE_FILE_FRESH_SECONDS = 2 * 60 * 60
 KEEP_OFF_MOST_SECONDS = 8 * 24 * 60 * 60
 _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False))
 # A margin past half the window would rule out going back for good.
@@ -298,23 +302,20 @@ def _name_of(accounts, identifier):
     return {entry.id: entry.name for entry in accounts}.get(identifier, identifier)
 
 
-def _per_account(config, enrolled, now=None, daily=None, held_off=None):
+def _per_account(config, enrolled, kept=None, held_off=None):
     """The thresholds accounts set for themselves, keyed by id as core takes
     them. config.env knows an account by the name enrolment gave it. Only a
     name in ACCOUNTS can set any, and ACCOUNTS is what `enrolled` is loaded
-    from, so every account that sets one is found here. `daily` maps an id to
-    what its owner uses a day and when its snapshot was taken, as `_daily`
-    finds them: that use is held on top of its weekly threshold, see
-    core.held_daily. The thresholds themselves hold to the end of the week.
-    An id in `held_off` is kept off altogether, see core.HELD_OFF."""
-    now = now or datetime.now(timezone.utc)
+    from, so every account that sets one is found here. `kept` maps an id to
+    what RESERVE_FILE says it keeps: it has no room while it shows that or
+    less, whatever its own threshold, which holds as the floor. An id in
+    `held_off` is kept off altogether, see core.HELD_OFF."""
     out = {}
     for entry in enrolled:
         own = dict(getattr(config, "account_thresholds", {}).get(entry.name, {}))
-        rate, read_at = (daily or {}).get(entry.id, (0, None))
-        held = core.held_daily(entry.snapshot, now, rate, read_at)
-        if held:
-            own["weekly"] = min(core.HELD_OFF, own.get("weekly", config.thresholds["weekly"]) + held)
+        if entry.id in (kept or {}):
+            floor = own.get("weekly", config.thresholds["weekly"])
+            own["weekly"] = min(core.HELD_OFF, max(floor, kept[entry.id] + 1))
         if entry.id in (held_off or ()):
             own["weekly"] = core.HELD_OFF
         if own:
@@ -322,34 +323,17 @@ def _per_account(config, enrolled, now=None, daily=None, held_off=None):
     return out
 
 
-def _daily(paths, state_dir, config, enrolled, now=None):
-    """What each account with RESERVE_DAILY_<name> holds a day, by id, and when
-    its snapshot was taken. A fresh figure in RESERVE_FILE replaces the
-    setting: another tool measured it. The snapshot's time is its file's: grazr
-    writes it on every reading of the account it is on."""
-    now = now or datetime.now(timezone.utc)
-    rates = dict(getattr(config, "reserve_daily", {}))
-    for name, rate in _reserve_file(state_dir, now)[0].items():
-        if name in rates:
-            rates[name] = rate
-    out = {}
-    for entry in enrolled:
-        if entry.name not in rates:
-            continue
-        try:
-            read_at = datetime.fromtimestamp(
-                os.path.getmtime(os.path.join(paths.accounts_dir, entry.id + ".json")), timezone.utc
-            )
-        except (OSError, ValueError, AttributeError):
-            read_at = None
-        out[entry.id] = (rates[entry.name], read_at)
-    return out
+def _kept(state_dir, enrolled, now):
+    """What each enrolled account RESERVE_FILE names keeps, by id."""
+    keep = _reserve_file(state_dir, now)[0]
+    return {entry.id: keep[entry.name] for entry in enrolled if entry.name in keep}
 
 
 def _reserve_file(state_dir, now):
-    """RESERVE_FILE: each account's daily use while the file is fresh, when each
-    account it keeps off is free again, and when each was put back early, by
-    name. Nothing from a file that is not what it should be."""
+    """RESERVE_FILE: what each account it names keeps this week (100, all of it,
+    where it cannot be read), when each account it keeps off is free again, and
+    when each was put back early, by name. Nothing from a file that is not what
+    it should be."""
     path = os.path.join(state_dir, RESERVE_FILE)
     try:
         written = os.path.getmtime(path)
@@ -359,14 +343,21 @@ def _reserve_file(state_dir, now):
         return {}, {}, {}
     if not isinstance(measured, dict):
         return {}, {}, {}
-    daily, at_reserve, resets = measured.get("daily"), measured.get("at_reserve"), measured.get("resets")
-    fresh = -60 <= now.timestamp() - written <= RESERVE_FILE_FRESH_SECONDS
+    keep, at_reserve, resets = measured.get("keep"), measured.get("at_reserve"), measured.get("resets")
+    kept = {}
+    if "keep" not in measured:
+        # An older tool, which left the reserve to grazr: it names under
+        # "daily" the accounts that have one.
+        older = measured.get("daily")
+        kept = {name: 100 for name in (older if isinstance(older, dict) else ())}
+    for name, told in (keep.items() if isinstance(keep, dict) else ()):
+        left, until = (told.get("left"), told.get("until")) if isinstance(told, dict) else (None, None)
+        if not (_number(left) and 0 <= left <= 100 and _number(until) and until <= written + KEEP_OFF_MOST_SECONDS):
+            kept[name] = 100
+        elif now.timestamp() < until:
+            kept[name] = math.ceil(left)
     return (
-        {
-            name: float(rate)
-            for name, rate in (daily.items() if fresh and isinstance(daily, dict) else ())
-            if _number(rate) and 0 <= rate <= 100
-        },
+        kept,
         {
             name: datetime.fromtimestamp(until, timezone.utc)
             for name, until in (at_reserve.items() if isinstance(at_reserve, dict) else ())
@@ -391,13 +382,10 @@ def _held_off(state_dir, enrolled, now):
 
 
 def _own_thresholds(runtime, enrolled, now=None):
-    """_per_account, with what each account holds a day, and those kept off."""
+    """_per_account, with what each account keeps, and those kept off."""
     paths, _, state_dir, config = runtime
     now = now or datetime.now(timezone.utc)
-    return _per_account(
-        config, enrolled, now, _daily(paths, state_dir, config, enrolled, now),
-        _held_off(state_dir, enrolled, now),
-    )
+    return _per_account(config, enrolled, _kept(state_dir, enrolled, now), _held_off(state_dir, enrolled, now))
 
 
 def _moved(decision, dry_run):
@@ -550,7 +538,6 @@ def load_config(path):
     # is not in ACCOUNTS is refused, since a misspelt name would be a reserve
     # that never holds.
     account_thresholds = {}
-    reserve_daily = {}
     for key in sorted(settings):
         for prefix, (group, _) in _THRESHOLD_KEYS.items():
             if not key.startswith(prefix + "_"):
@@ -560,10 +547,7 @@ def load_config(path):
                 raise ValueError("%s sets a threshold for %r, which is not in ACCOUNTS" % (key, name))
             account_thresholds.setdefault(name, {})[group] = _percent(settings.pop(key), key, None)
         if key.startswith(RESERVE_DAILY + "_"):
-            name = key[len(RESERVE_DAILY) + 1:]
-            if name not in accounts:
-                raise ValueError("%s holds a reserve for %r, which is not in ACCOUNTS" % (key, name))
-            reserve_daily[name] = _percent(settings.pop(key), key, None)
+            settings.pop(key)  # retired, see RESERVE_DAILY
     if settings:
         raise ValueError("Unknown setting(s): %s" % ", ".join(sorted(settings)))
 
@@ -574,7 +558,6 @@ def load_config(path):
         dry_run=flags[1],
         account_thresholds=account_thresholds,
         return_margin=return_margin,
-        reserve_daily=reserve_daily,
         alert_command=alert_command,
     )
 
