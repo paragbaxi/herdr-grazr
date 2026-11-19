@@ -256,6 +256,10 @@ The price is more swaps, and each one costs a token refresh and a cold prompt
 cache on every pane. It takes 0 to 50, and it is one value for every account,
 since a swap costs the same whichever account it moves to.
 
+`RETURN_MARGIN=off` never goes back for a sooner week: grazr then moves only
+off an account below its thresholds. It is for a fleet whose accounts another
+tool places on each machine, where a second mover would undo the first.
+
 Start with `DRY_RUN=1` for a day. Every decision is written to `grazr.log` in
 the plugin's state directory, `~/.local/state/herdr/plugins/wazum.grazr`, with a
 timestamp, since the status line's own output is the bar. The log also says what

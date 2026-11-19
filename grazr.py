@@ -32,7 +32,8 @@ import stores
 
 # `account_thresholds` maps an account name, as written in ACCOUNTS, to the
 # thresholds it sets for itself. `return_margin` is how many points above its
-# threshold a parked account needs before going back for its week is worth a swap.
+# threshold a parked account needs before going back for its week is worth a swap;
+# None never goes back.
 # `reserve_daily` maps an account name to the points of its week its owner uses a
 # day elsewhere, held until the reset on top of its weekly threshold.
 # `alert_command` is run, detached, with a title and a text when grazr refuses
@@ -55,7 +56,8 @@ REMAINING_WEEKLY=10      # weekly windows, incl. per-model ones
 # and hold what you use of it a day until its week resets:
 # RESERVE_DAILY_personal=10
 
-# Points above its threshold a parked week needs before going back for it.
+# Points above its threshold a parked week needs before going back for it,
+# or off: never go back (another tool places the accounts).
 RETURN_MARGIN=10
 
 # Preference order. First account with headroom wins.
@@ -88,6 +90,9 @@ KEEP_OFF_MOST_SECONDS = 8 * 24 * 60 * 60
 _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False))
 # A margin past half the window would rule out going back for good.
 RETURN_MARGIN_CEILING = 50
+# RETURN_MARGIN=off never goes back for a week that ends sooner: for a fleet whose
+# accounts another tool places, so grazr moves only off one below its thresholds.
+RETURN_MARGIN_OFF = "off"
 
 LOG = "grazr.log"
 # When each refusal to save a login under the wrong name was last reported, by
@@ -524,9 +529,11 @@ def load_config(path):
     thresholds = {}
     for key, (group, default) in _THRESHOLD_KEYS.items():
         thresholds[group] = _percent(settings.pop(key, None), key, default)
-    return_margin = _percent(
-        settings.pop("RETURN_MARGIN", None), "RETURN_MARGIN", core.RETURN_MARGIN, RETURN_MARGIN_CEILING
-    )
+    return_margin = settings.pop("RETURN_MARGIN", None)
+    if return_margin != RETURN_MARGIN_OFF:
+        return_margin = _percent(return_margin, "RETURN_MARGIN", core.RETURN_MARGIN, RETURN_MARGIN_CEILING)
+    else:
+        return_margin = None
     flags = [_flag(settings.pop(key, None), key, default) for key, default in _FLAG_KEYS]
     accounts = shlex.split(settings.pop("ACCOUNTS", "") or "")
     alert_command = settings.pop("ALERT_COMMAND", "") or ""
@@ -1357,7 +1364,9 @@ def status(runtime=None):
     margin = config.return_margin
     print("thresholds: %s remaining%s%s\n"
           % (_describe_thresholds(config.thresholds),
-             "" if margin == core.RETURN_MARGIN else "   return margin %d" % margin,
+             "" if margin == core.RETURN_MARGIN
+             else "   return margin off" if margin is None
+             else "   return margin %d" % margin,
              "   DRY_RUN" if config.dry_run else ""))
 
     enrolled = accounts.load(paths, config.accounts)
