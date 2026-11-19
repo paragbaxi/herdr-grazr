@@ -3779,6 +3779,123 @@ class StatuslineTest(EnrolledPairFixture):
         self.assertEqual(self.rotations, [])
 
 
+class EarlyResetTest(EnrolledPairFixture):
+    """A limit reset puts an account's week back to full early and leaves its
+    reset time alone. The record keeps a window's lowest figure, so without
+    this the week would look spent until it ended, and the reset unused."""
+
+    def setUp(self):
+        super().setUp()
+        now = datetime.now(timezone.utc)
+        self.week_ends = int((now + timedelta(days=3)).timestamp()) // 60 * 60
+
+    def payload(self, session, used):
+        return json.dumps({"session_id": session, "rate_limits": {"seven_day": {
+            "used_percentage": used, "resets_at": self.week_ends,
+        }}})
+
+    def show(self, session, used):
+        payload = self.payload(session, used)
+        self.invoke(lambda runtime: grazr.statusline(runtime, payload, detach=lambda: None))
+
+    def stored(self):
+        with open(os.path.join(self.state_dir, "accounts", "uuid-work.json")) as handle:
+            return json.load(handle)
+
+    def left(self):
+        return [entry["remaining"] for entry in self.stored()["snapshot"] if entry["group"] == "weekly"]
+
+    def age_book(self, minutes):
+        """As if each session's figures last changed that long ago."""
+        path = os.path.join(self.state_dir, "weekly-seen.json")
+        with open(path) as handle:
+            book = json.load(handle)
+        for sessions in book.values():
+            for windows in sessions.values():
+                for value in windows.values():
+                    value[1] = (datetime.fromisoformat(value[1]) - timedelta(minutes=minutes)).isoformat()
+        with open(path, "w") as handle:
+            json.dump(book, handle)
+
+    def mark(self, when):
+        """reserve.json, written a minute after the week was put back."""
+        path = os.path.join(self.state_dir, "reserve.json")
+        with open(path, "w") as handle:
+            json.dump({"resets": {"work": int(when.timestamp())}}, handle)
+        written = (when + timedelta(minutes=1)).timestamp()
+        os.utime(path, (written, written))
+
+    def test_a_session_whose_own_figure_rises_puts_the_week_back(self):
+        self.show("busy", 99)
+        self.show("idle", 99)
+        self.assertEqual(self.left(), [1])
+
+        self.show("busy", 0)  # its next request, after the reset
+
+        self.assertEqual(self.left(), [100])
+        self.assertEqual([entry["group"] for entry in self.stored()["early_resets"]], ["weekly"])
+        self.show("idle", 99)  # idle since: the old week
+        self.assertEqual(self.left(), [100])
+        self.show("busy", 4)
+        self.assertEqual(self.left(), [96])
+        self.show("idle", 2)  # its first request since
+        self.assertEqual(self.left(), [96])
+        with open(os.path.join(self.state_dir, "grazr.log")) as handle:
+            self.assertIn("work's weekly window ending", handle.read())
+
+    def test_without_a_rise_the_lowest_figure_stands(self):
+        """Idle panes repeat old figures: one that is higher than the record is
+        not a reset unless the same session saw its own figure rise."""
+        self.show("a", 50)
+        self.show("b", 40)
+        self.show("c", 10)
+        self.assertEqual(self.left(), [50])
+        self.show("a", 55)  # a rise of 5 is no reset
+        self.show("a", 50)
+        self.assertEqual(self.left(), [45])
+        self.assertNotIn("early_resets", self.stored())
+
+    def test_a_tool_that_saw_the_reset_puts_the_week_back_for_a_new_session(self):
+        """Every session there may have ended, or be idle, when its owner used
+        the reset: the next one to make a request reads the week as it is."""
+        self.show("gone", 99)
+        self.age_book(10)
+        self.mark(datetime.now(timezone.utc) - timedelta(minutes=1))
+
+        self.show("gone", 99)
+        self.assertEqual(self.left(), [1])
+        self.show("new", 3)
+
+        self.assertEqual(self.left(), [97])
+        self.show("gone", 99)
+        self.assertEqual(self.left(), [97])
+        self.show("new", 5)
+        self.assertEqual(self.left(), [95])
+
+    def test_a_mark_counts_once(self):
+        self.mark(datetime.now(timezone.utc) - timedelta(minutes=1))
+        self.show("new", 3)
+        self.show("other", 1)  # since the mark too, but the week is put back once
+        self.assertEqual(self.left(), [97])
+
+    def test_a_payload_with_no_session_counts_as_before(self):
+        for used in (99, 0):
+            payload = json.dumps({"rate_limits": {"seven_day": {"used_percentage": used, "resets_at": self.week_ends}}})
+            self.invoke(lambda runtime, p=payload: grazr.statusline(runtime, p, detach=lambda: None))
+        self.assertEqual(self.left(), [1])
+
+    def test_ended_weeks_leave_the_book(self):
+        self.show("a", 50)
+        path = os.path.join(self.state_dir, "weekly-seen.json")
+        with open(path) as handle:
+            book = json.load(handle)
+        self.assertEqual(list(book["uuid-work"]), ["a"])
+        self.week_ends -= 4 * 24 * 60 * 60  # a payload of a week that has ended
+        self.show("b", 10)
+        with open(path) as handle:
+            self.assertEqual(list(json.load(handle)["uuid-work"]), ["a"])
+
+
 class ConnectTest(EnrolledPairFixture):
     """Connecting grazr to Claude's status line, from the enrol pane or the
     action, and noticing when it has come loose."""
@@ -4280,13 +4397,19 @@ class ReserveEndsWithTheWeekTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, directory, True)
         path = os.path.join(directory, grazr.RESERVE_FILE)
         with open(path, "w") as f:
-            json.dump({"daily": {"chat": 7.8, "bad": True}, "at_reserve": {"chat": 1794528000, "bad": "soon", "worse": True}}, f)
+            json.dump({
+                "daily": {"chat": 7.8, "bad": True},
+                "at_reserve": {"chat": 1794528000, "bad": "soon", "worse": True},
+                # chat's week put back an hour before, work's 9 days before: too old.
+                "resets": {"chat": 1794522600, "work": 1793748600, "bad": "now"},
+            }, f)
         written = datetime(2026, 11, 12, 23, 30, tzinfo=timezone.utc)
         os.utime(path, (written.timestamp(), written.timestamp()))
         reset = datetime(2026, 11, 13, tzinfo=timezone.utc)
-        daily, until = grazr._reserve_file(directory, written)
+        daily, until, put_back = grazr._reserve_file(directory, written)
         self.assertEqual(daily, {"chat": 7.8})
         self.assertEqual(until, {"chat": reset})
+        self.assertEqual(put_back, {"chat": written - timedelta(hours=1)})
         chat = core.Account("id-chat", "chat", None)
         self.assertEqual(grazr._held_off(directory, [chat], reset - timedelta(minutes=1)), {"id-chat": reset})
         self.assertEqual(grazr._held_off(directory, [chat], reset), {})

@@ -22,7 +22,7 @@ import termios
 import time
 import tty
 from collections import namedtuple
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import accounts
 import atomic
@@ -78,7 +78,10 @@ RESERVE_DAILY = "RESERVE_DAILY"
 # {"<name>": unix seconds} it keeps an enrolled account off until then, whatever
 # its snapshot here shows: a tool that reads every machine knows of use since.
 # That holds however old the file is, since it ends by itself, but only up to a
-# week and a day after the file was written.
+# week and a day after the file was written. With "resets": {"<name>": unix
+# seconds} it says the account's week was put back early then, by a limit reset
+# its owner used: from then the first figure of a session that has changed since
+# is the week's, whatever the record shows (see `_early_resets`).
 RESERVE_FILE = "reserve.json"
 RESERVE_FILE_FRESH_SECONDS = 2 * 60 * 60
 KEEP_OFF_MOST_SECONDS = 8 * 24 * 60 * 60
@@ -339,19 +342,19 @@ def _daily(paths, state_dir, config, enrolled, now=None):
 
 
 def _reserve_file(state_dir, now):
-    """RESERVE_FILE: each account's daily use while the file is fresh, and when
-    each account it keeps off is free again, by name. Nothing from a file that
-    is not what it should be."""
+    """RESERVE_FILE: each account's daily use while the file is fresh, when each
+    account it keeps off is free again, and when each was put back early, by
+    name. Nothing from a file that is not what it should be."""
     path = os.path.join(state_dir, RESERVE_FILE)
     try:
         written = os.path.getmtime(path)
         with open(path) as handle:
             measured = json.load(handle)
     except (OSError, ValueError):
-        return {}, {}
+        return {}, {}, {}
     if not isinstance(measured, dict):
-        return {}, {}
-    daily, at_reserve = measured.get("daily"), measured.get("at_reserve")
+        return {}, {}, {}
+    daily, at_reserve, resets = measured.get("daily"), measured.get("at_reserve"), measured.get("resets")
     fresh = -60 <= now.timestamp() - written <= RESERVE_FILE_FRESH_SECONDS
     return (
         {
@@ -363,6 +366,11 @@ def _reserve_file(state_dir, now):
             name: datetime.fromtimestamp(until, timezone.utc)
             for name, until in (at_reserve.items() if isinstance(at_reserve, dict) else ())
             if _number(until) and written < until <= written + KEEP_OFF_MOST_SECONDS
+        },
+        {
+            name: datetime.fromtimestamp(at, timezone.utc)
+            for name, at in (resets.items() if isinstance(resets, dict) else ())
+            if _number(at) and written - KEEP_OFF_MOST_SECONDS <= at <= written + 60
         },
     )
 
@@ -683,7 +691,8 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
         previous = _latest_reading(paths, active)
         name = _name_of(enrolled, active)
         _log_leftovers(state_dir, now, name, core.replaced(previous, limits, now))
-        limits = core.merged(previous, limits, now)
+        previous, limits_now = _early_resets(runtime, payload, active, name, previous, limits, now)
+        limits = core.merged(previous, limits_now, now)
         # An idle pane repeats an old figure every minute, and a payload can
         # lack a window that ran out while the account was parked. Either can
         # be the first payload after a swap. Only a reading that lowers a
@@ -719,6 +728,94 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
 
 
 LIVE_SEEN_FILE = "live-seen.json"
+
+# Each session's weekly figures, by account, and when each last changed: what
+# tells a session that has made a request since a week was put back early from
+# one idle since, which repeats the old week.
+WEEKLY_SEEN_FILE = "weekly-seen.json"
+
+
+def _early_resets(runtime, payload, active, name, previous, limits, now):
+    """`previous` and `limits` as `core.merged` takes them, once an account's
+    week may have been put back early by a limit reset. That leaves the week's
+    reset time alone, so the record's lowest figure would stand until the week
+    ends, and the reset would look unused. A session whose own figure rises
+    puts the week back now; RESERVE_FILE's "resets" put it back when a tool
+    that saw it says, for the first session that has changed since. Either way
+    the record's figure gives way to that session's, and from then a session
+    counts only once its figure has changed. Run under the readings lock."""
+    paths, _, state_dir, _ = runtime
+    try:
+        session = json.loads(payload).get("session_id")
+    except (ValueError, AttributeError):
+        session = None
+    back = accounts.early_resets(paths, active)
+    marked = _reserve_file(state_dir, now)[2].get(name)
+    if not session or not isinstance(session, str):
+        return previous, limits
+    path = os.path.join(state_dir, WEEKLY_SEEN_FILE)
+    try:
+        with open(path) as handle:
+            book = json.load(handle)
+        if not isinstance(book, dict):
+            book = {}
+    except (OSError, ValueError):
+        book = {}
+    before = _weekly_mine(book.get(active, {}).get(session))
+    mine = core.seen(before, limits, now)
+    rose = core.rises(before, limits, back)
+    put = {key: now for key in rose}
+    for key, (_, changed) in mine.items():
+        if marked and key[1] > marked and changed >= marked and back.get(key, marked - timedelta(seconds=1)) < marked:
+            put.setdefault(key, marked)
+    if put:
+        back.update(put)
+        accounts.record_early_resets(paths, active, back, now)
+        figures = {(entry.group, entry.resets_at): entry.remaining for entry in limits}
+        for (group, resets_at), at in sorted(put.items()):
+            _log(state_dir, now, "%s's %s window ending %s was put back early at %s: %d%% left" % (
+                name, group, resets_at.astimezone().strftime("%a %H:%M"),
+                at.astimezone().strftime("%a %H:%M"), figures[(group, resets_at)]))
+    if mine != before:
+        book.setdefault(active, {})[session] = _weekly_stored(mine)
+        for account in list(book):
+            sessions = book[account] if isinstance(book[account], dict) else {}
+            for other in list(sessions):
+                live = {key: value for key, value in _weekly_mine(sessions[other]).items() if key[1] > now}
+                if live:
+                    sessions[other] = _weekly_stored(live)
+                else:
+                    sessions.pop(other)
+            if sessions:
+                book[account] = sessions
+            else:
+                book.pop(account)
+        try:
+            atomic.write(path, json.dumps(book))
+        except OSError:
+            pass
+    return core.put_back(previous, limits, mine, back, set(put))
+
+
+def _weekly_stored(mine):
+    return {
+        "%s %s" % (group, resets_at.isoformat()): [remaining, changed.isoformat()]
+        for (group, resets_at), (remaining, changed) in mine.items()
+    }
+
+
+def _weekly_mine(stored):
+    """A session's weekly windows as WEEKLY_SEEN_FILE keeps them, read back.
+    Nothing from an entry that is not as it should be."""
+    out = {}
+    for key, value in (stored.items() if isinstance(stored, dict) else ()):
+        try:
+            group, resets_at = key.split(" ", 1)
+            remaining, changed = value
+            out[(group, accounts.parse_time(resets_at))] = (remaining, datetime.fromisoformat(changed))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return out
 
 
 def _keep_parked_current(runtime):

@@ -95,6 +95,40 @@ def record_snapshot(paths, identifier, snapshot):
     write(paths, identifier, account)
 
 
+def early_resets(paths, identifier):
+    """The windows of the account put back early, (group, resets_at) to when, as
+    `record_early_resets` keeps them. Nothing from a file not as it should be."""
+    try:
+        stored = read(paths, identifier).get("early_resets") or []
+        out = {}
+        for entry in stored:
+            # When, to the second: a session's change a moment after it must
+            # not read as before it.
+            at = datetime.fromisoformat(entry["at"])
+            resets_at = parse_time(entry["resets_at"])
+            if resets_at and at.tzinfo:
+                out[(entry["group"], resets_at)] = at
+        return out
+    except (OSError, ValueError, AttributeError, KeyError, TypeError):
+        return {}
+
+
+def record_early_resets(paths, identifier, back, now):
+    """Keep when each window of the account was put back early, for those not
+    ended. Another tool reads it: what the snapshot shows of such a window is
+    the week as it stands since."""
+    try:
+        account = read(paths, identifier)
+    except (OSError, ValueError):
+        return
+    account["early_resets"] = [
+        {"group": group, "resets_at": resets_at.isoformat(), "at": at.isoformat()}
+        for (group, resets_at), at in sorted(back.items())
+        if resets_at > now
+    ]
+    write(paths, identifier, account)
+
+
 def mark_first_reading_due(paths, identifier, due=True):
     """Set by the swap that installs this account, cleared by the first
     reading that shows a turn on it."""

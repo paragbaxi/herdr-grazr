@@ -225,6 +225,23 @@ Since the time ends it, it holds however old the file is, so it outlasts a
 tool that stops writing, but never past a week and a day from when the file
 was written.
 
+### Limit resets
+
+Anthropic gives an account a limit reset now and then (Settings > Usage,
+"Limit resets"). Using one puts the week back to full at once and leaves the
+week's reset time where it was. *grazr* keeps a window's lowest figure, since
+an idle pane repeats an old one, so on its own it would read the week as spent
+until it ended. Instead, a session whose own weekly figure rises ten points or
+more puts the week back: its figure replaces the record. From then a session
+counts only once its figure has changed, since one idle since repeats the old
+week. The account's file keeps when, under `early_resets`, and the log says so.
+
+A tool that knows the reset was used can say so first, in Unix seconds:
+`{"resets": {"chat": 1794522600}}` in `reserve.json`. The first session on
+`chat` whose figure has changed since then puts the week back, even one that
+never saw the old week. It counts for up to a week and a day before the file
+was written.
+
 ### The return margin
 
 `RETURN_MARGIN` is the ten points a parked week needs above its weekly
