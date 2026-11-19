@@ -235,7 +235,10 @@ A tool that knows the reset was used can say so first, in Unix seconds:
 `{"resets": {"chat": 1794522600}}` in `reserve.json`. The first session on
 `chat` whose figure has changed since then puts the week back, even one that
 never saw the old week. It counts for up to a week and a day before the file
-was written.
+was written. A parked account it names has no session here to show the rise, so
+its parked week reads as full from then, once, and a swap or move back onto it
+is no longer refused as below your thresholds. A week this machine saw put back
+within 12 hours of then is left as it reads.
 
 ### The return margin
 

@@ -6,6 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Fixed
+
+- A limit reset `reserve.json` names for an account parked here now puts its
+  parked week back to full, once. No session here was on it to see the rise,
+  so its snapshot showed the old week spent and refused every move back onto
+  it until the week ended. A week this machine saw put back about then is left
+  as it reads; the active account is still its sessions' to say.
+
 ### Added
 
 - `RETURN_MARGIN=off` never goes back for a week that ends sooner: grazr then
