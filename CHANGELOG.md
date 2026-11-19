@@ -8,6 +8,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A limit reset that puts an account's week back to full early (Settings >
+  Usage, "Limit resets") now shows. It leaves the week's reset time alone, so
+  the record kept the week's lowest figure and the week looked spent until it
+  ended. A session whose own weekly figure rises ten points or more puts the
+  week back; from then a session counts only once its figure has changed, as
+  an idle one repeats the old week. `"resets": {"<name>": <unix seconds>}` in
+  `reserve.json`, from a tool that knows the reset was used, puts the week back
+  for the first session to change since. The account file keeps when, under
+  `early_resets`, and the log says so.
+
 - `REMAINING_SESSION_<name>` and `REMAINING_WEEKLY_<name>` give one account
   thresholds of its own, such as a reserve on an account you also chat on.
   Every decision about an account uses its own, whichever account is active.

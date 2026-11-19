@@ -66,6 +66,63 @@ def merged(previous, current, now):
     return _live(readings, now)
 
 
+# Within its week a session's own weekly figure only falls, as each comes from its
+# latest request. One that rises this much was put back early: Anthropic gives an
+# account a limit reset now and then (Settings > Usage, "Limit resets"), which puts
+# the week back to full and leaves its reset time where it was.
+RISE = 10
+
+
+def _weekly(limits):
+    return {
+        (entry.group, entry.resets_at): entry.remaining
+        for entry in limits
+        if entry.group == "weekly" and entry.resets_at
+    }
+
+
+def seen(mine, current, now):
+    """A session's weekly windows, (group, resets_at) to (remaining, changed),
+    with this payload's: `changed` is when its figure last changed, so an idle
+    session that repeats its figure keeps an old time. Ended windows go."""
+    out = {key: value for key, value in mine.items() if key[1] > now}
+    for key, remaining in _weekly(current).items():
+        if key not in out or out[key][0] != remaining:
+            out[key] = (remaining, now)
+    return out
+
+
+def rises(mine, current, back):
+    """The weekly windows this session saw put back: its own figure rose by
+    RISE or more since `mine`, what it showed before. A window `back` says was
+    put back since that figure is the same reset, seen late by a session idle
+    since: the record stands, and the session's figure counts from now."""
+    return {
+        key
+        for key, remaining in _weekly(current).items()
+        if key in mine and remaining >= mine[key][0] + RISE
+        and (key not in back or mine[key][1] >= back[key])
+    }
+
+
+def put_back(previous, current, mine, back, rose):
+    """`previous` and `current` as `merged` takes them once a week was put back
+    early. `back` maps each such window, (group, resets_at), to when; `rose` is
+    those this payload puts back, whose record no longer counts. A figure of a
+    window put back counts only if the session's figure changed since, in
+    `mine` as `seen` keeps it: a session idle since repeats the old week, and
+    the record stands. A payload no session is known for counts, as before."""
+    if isinstance(previous, list):
+        previous = [entry for entry in previous if (entry.group, entry.resets_at) not in rose]
+    kept = []
+    for entry in current:
+        key = (entry.group, entry.resets_at)
+        if key in back and key not in rose and key in mine and mine[key][1] < back[key]:
+            continue
+        kept.append(entry)
+    return previous, kept
+
+
 def moved(previous, current):
     """Whether `current` shows spending the record does not: a window lowered
     or a new one opened. A payload that merely lacks a window, or repeats one,
