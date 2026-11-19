@@ -691,6 +691,7 @@ def statusline(runtime=None, payload=None, spawn=subprocess.run, detach=None):
             _log(state_dir, now, "First reading on %s after the swap: %s" % (name, _cost(previous, limits)))
             accounts.mark_first_reading_due(paths, active, due=False)
         accounts.record_snapshot(paths, active, limits)
+        _put_back_parked(runtime, now)
         # A parked account is the one grazr chose to leave, so what its window
         # had left when it ran out is the number that says whether leaving was
         # right. Nobody reads for it, so its record is checked here instead,
@@ -785,6 +786,60 @@ def _early_resets(runtime, payload, active, name, previous, limits, now):
         except OSError:
             pass
     return core.put_back(previous, limits, mine, back, set(put))
+
+
+# How far apart a reset's time here and herdtask's can be and still be the same
+# reset: each machine sees it at its next request, and its owner may say he used
+# it some time after he did (herdtask's riseSkew).
+RESET_SKEW = timedelta(hours=12)
+WEEK = timedelta(days=7)
+
+
+def _put_back_parked(runtime, now):
+    """A parked account whose week RESERVE_FILE's "resets" says was put back
+    early: no session here is on it to see its figure rise, so its snapshot
+    still shows the old week, spent, and refuses every move back onto it until
+    the week ends. The snapshot's figure of that week becomes all of it, once,
+    and `early_resets` keeps when, so a session idle since that repeats the old
+    week leaves it be once the account is active again. A week this machine saw
+    put back about then already reads as it stands. The active account is its
+    sessions' to say (`_early_resets`). Run under the readings lock."""
+    paths, _, state_dir, _ = runtime
+    marked = _reserve_file(state_dir, now)[2]
+    if not marked:
+        return
+    active = claude.active_account(paths)
+    for parked in accounts.load(paths, []):
+        at = marked.get(parked.name)
+        if not at or parked.id == active or not isinstance(parked.snapshot, list):
+            continue
+        back = accounts.early_resets(paths, parked.id)
+        put, snapshot = {}, []
+        for entry in parked.snapshot:
+            key = (entry.group, entry.resets_at)
+            seen = back.get(key)
+            if (
+                entry.group == "weekly" and entry.resets_at and at < entry.resets_at <= at + WEEK
+                and (seen is None or seen < at - RESET_SKEW)
+            ):
+                put[key] = at
+                entry = entry._replace(remaining=100)
+            snapshot.append(entry)
+        if not put:
+            continue
+        back.update(put)
+        accounts.record_snapshot(paths, parked.id, snapshot)
+        accounts.record_early_resets(paths, parked.id, back, now)
+        for (group, resets_at), at in sorted(put.items()):
+            _log(state_dir, now, "%s's %s window ending %s was put back early at %s, as the reserve file says: 100%% left" % (
+                parked.name, group, resets_at.astimezone().strftime("%a %H:%M"), at.astimezone().strftime("%a %H:%M")))
+
+
+def _put_back_parked_locked(runtime, now):
+    """_put_back_parked under the readings lock, for a caller not holding it."""
+    state_dir = runtime[2]
+    with _file_lock(os.path.join(state_dir, "readings.lock"), wait=True):
+        _put_back_parked(runtime, now)
 
 
 def _weekly_stored(mine):
@@ -977,6 +1032,7 @@ def decide(runtime=None):
         limits = _latest_reading(paths, active)
         if limits is None:
             return 0
+        _put_back_parked_locked(runtime, now)
         enrolled = accounts.load(paths, config.accounts)
         decision = core.decide(
             limits, active, enrolled, now, config.thresholds,
@@ -1272,6 +1328,7 @@ def swap(runtime=None, target=None):
         active = claude.active_account(paths)
         if active is None:
             return _refuse_swap("Not logged in, nothing to swap from")
+        _put_back_parked_locked(runtime, now)
         limits = _latest_reading(paths, active)
         if target is not None:
             enrolled = accounts.load(paths, [])

@@ -3964,6 +3964,110 @@ class EarlyResetTest(EnrolledPairFixture):
             self.assertEqual(list(json.load(handle)["uuid-work"]), ["a"])
 
 
+class ParkedResetTest(EnrolledPairFixture):
+    """A limit reset used on an account no machine here is on: no session can
+    see it rise, so only RESERVE_FILE's "resets" says so. Its parked snapshot
+    still shows the old week spent, which would refuse every move back onto it
+    until the week ends (herdtask, 2026-11-19: the fleet moved off spent qa, he
+    used qa's reset, and nothing could come back to it)."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_config('REMAINING_WEEKLY=10\nACCOUNTS="work personal"\n')
+        now = datetime.now(timezone.utc)
+        self.week_ends = (now + timedelta(days=3)).replace(microsecond=0)
+        self.park("uuid-personal", "personal", 1)
+
+    def park(self, identifier, name, remaining, early_resets=None):
+        path = os.path.join(self.state_dir, "accounts", identifier + ".json")
+        stored = {
+            "name": name,
+            "oauthAccount": {"accountUuid": identifier},
+            "snapshot": [{"kind": "weekly_all", "scope": None, "group": "weekly",
+                          "remaining": remaining, "resets_at": self.week_ends.isoformat()}],
+        }
+        if early_resets:
+            stored["early_resets"] = early_resets
+        with open(path, "w") as f:
+            json.dump(stored, f)
+
+    def mark(self, name, when):
+        """reserve.json as herdtask writes it, a minute after the reset was used."""
+        path = os.path.join(self.state_dir, grazr.RESERVE_FILE)
+        with open(path, "w") as f:
+            json.dump({"keep": {}, "at_reserve": {}, "resets": {name: int(when.timestamp())}}, f)
+        written = (when + timedelta(minutes=1)).timestamp()
+        os.utime(path, (written, written))
+
+    def stored(self, identifier="uuid-personal"):
+        with open(os.path.join(self.state_dir, "accounts", identifier + ".json")) as handle:
+            return json.load(handle)
+
+    def left(self, identifier="uuid-personal"):
+        return [entry["remaining"] for entry in self.stored(identifier)["snapshot"] if entry["group"] == "weekly"]
+
+    def swap_to(self, target):
+        return self.invoke(lambda runtime: grazr.swap(runtime, target=target))
+
+    def test_without_a_reset_a_spent_parked_account_is_refused(self):
+        code, printed = self.swap_to("personal")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.rotations, [])
+        self.assertIn("below your thresholds", printed)
+
+    def test_a_reset_used_on_a_parked_account_lets_a_move_back_onto_it(self):
+        used = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=1)
+        self.mark("personal", used)
+
+        code, printed = self.swap_to("personal")
+
+        self.assertEqual(code, 0, printed)
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+        self.assertEqual(self.left(), [100])
+        self.assertEqual(
+            [(entry["group"], entry["at"]) for entry in self.stored()["early_resets"]],
+            [("weekly", used.isoformat())],
+        )
+        with open(os.path.join(self.state_dir, "grazr.log")) as handle:
+            self.assertIn("personal's weekly window ending", handle.read())
+
+    def test_a_week_put_back_since_is_left_as_it_reads(self):
+        """A machine on it after the reset read what was spent since: that
+        figure stands, and the reset is put back once."""
+        used = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=2)
+        self.park("uuid-personal", "personal", 60, early_resets=[
+            {"group": "weekly", "resets_at": self.week_ends.isoformat(), "at": (used + timedelta(minutes=5)).isoformat()},
+        ])
+        self.mark("personal", used)
+
+        code, _ = self.swap_to("personal")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.left(), [60])
+
+    def test_only_the_account_the_reset_was_used_on_is_put_back(self):
+        self.mark("other", datetime.now(timezone.utc) - timedelta(minutes=1))
+        code, printed = self.swap_to("personal")
+        self.assertEqual(code, 1)
+        self.assertIn("below your thresholds", printed)
+        self.assertEqual(self.left(), [1])
+
+    def test_the_active_account_is_left_to_its_sessions(self):
+        """A session on it says how much of the week put back it has spent."""
+        self.park("uuid-work", "work", 1)
+        self.mark("work", datetime.now(timezone.utc) - timedelta(minutes=1))
+        self.swap_to("personal")
+        self.assertEqual(self.left("uuid-work"), [1])
+
+    def test_grazrs_own_move_off_a_spent_account_takes_one_put_back(self):
+        self.park("uuid-work", "work", 1)
+        self.mark("personal", datetime.now(timezone.utc) - timedelta(minutes=1))
+
+        self.invoke(grazr.decide)
+
+        self.assertEqual(self.rotations[0][2:4], ("uuid-work", "uuid-personal"))
+
+
 class ConnectTest(EnrolledPairFixture):
     """Connecting grazr to Claude's status line, from the enrol pane or the
     action, and noticing when it has come loose."""
