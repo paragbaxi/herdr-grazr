@@ -3818,8 +3818,12 @@ class EarlyResetTest(EnrolledPairFixture):
             json.dump(book, handle)
 
     def mark(self, when):
-        with open(os.path.join(self.state_dir, "reserve.json"), "w") as handle:
+        """reserve.json, written a minute after the week was put back."""
+        path = os.path.join(self.state_dir, "reserve.json")
+        with open(path, "w") as handle:
             json.dump({"resets": {"work": int(when.timestamp())}}, handle)
+        written = (when + timedelta(minutes=1)).timestamp()
+        os.utime(path, (written, written))
 
     def test_a_session_whose_own_figure_rises_puts_the_week_back(self):
         self.show("busy", 99)
