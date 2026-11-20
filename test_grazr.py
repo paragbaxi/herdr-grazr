@@ -2604,6 +2604,53 @@ class ActOnDecisionTest(unittest.TestCase):
         self.assertIn(clock(LATER), line)
         self.assertNotIn("+00:00", line, "a person reads a clock, not an ISO timestamp")
 
+    def tell(self, told):
+        """RESERVE_FILE as herdtask writes it, dated by this suite's NOW."""
+        path = os.path.join(self.state_dir, grazr.RESERVE_FILE)
+        with open(path, "w") as f:
+            json.dump(told, f)
+        os.utime(path, (NOW.timestamp(), NOW.timestamp()))
+
+    def test_an_account_held_by_what_it_keeps_waits_for_that_week(self):
+        """personal's session reopens at SOONER, but what it keeps holds it
+        until its week ends. The toast held it only to its own thresholds, so
+        it named personal at SOONER, a wait that ends with nothing free, while
+        work is free at LATER (tl-hus7)."""
+        week = NOW + timedelta(days=3)
+        self.tell({"keep": {"personal": {"left": 40, "until": week.timestamp()}}, "at_reserve": {}})
+        others = [account_named("work", "uuid-work"), account_named("personal", "uuid-personal", snapshot=[
+            limit(group="session", remaining=10, resets_at=SOONER),
+            limit(group="weekly", remaining=30, resets_at=week),
+        ])]
+
+        line = self.act("exhausted", limits=[limit(group="weekly", remaining=0, resets_at=LATER)], accounts=others)
+
+        self.assertIn("earliest reset %s (work, weekly window)" % clock(LATER), line)
+
+    def test_an_account_kept_off_is_free_when_the_file_says(self):
+        """at_reserve keeps personal off until SOONER whatever it shows: then
+        it is the first free, though no window of its own is spent."""
+        self.tell({"keep": {}, "at_reserve": {"personal": SOONER.timestamp()}})
+        others = [account_named("work", "uuid-work"), account_named("personal", "uuid-personal", snapshot=[
+            limit(group="weekly", remaining=90, resets_at=NOW + timedelta(days=3)),
+        ])]
+
+        line = self.act("exhausted", limits=[limit(group="weekly", remaining=0, resets_at=LATER)], accounts=others)
+
+        self.assertIn("earliest reset %s (personal, kept off)" % clock(SOONER), line)
+
+    def test_kept_off_waits_for_a_window_spent_past_it_too(self):
+        """Let back at SOONER, personal is still spent on its session until
+        LATER, so LATER is when it is free."""
+        self.tell({"keep": {}, "at_reserve": {"personal": SOONER.timestamp()}})
+        others = [account_named("personal", "uuid-personal", snapshot=[
+            limit(group="session", remaining=0, resets_at=LATER),
+        ])]
+
+        line = self.act("exhausted", limits=[limit(group="weekly", remaining=0, resets_at=None)], accounts=others)
+
+        self.assertIn("earliest reset %s (personal, session window)" % clock(LATER), line)
+
     def test_a_window_with_headroom_does_not_set_the_wait(self):
         """The session window reopening in an hour changes nothing while the
         weekly one is what holds every account back."""
@@ -3029,6 +3076,23 @@ class SwapTest(EnrolledPairFixture):
                 self.assert_swapped()
                 self.rotations.clear()
 
+    def test_one_held_by_what_it_keeps_names_its_reset_not_unknown(self):
+        """ghee22's case: herdtask says it keeps 27, its own floor is 6, and
+        it shows 27. The decision holds it; the toast held it to the floor
+        alone, found nothing spent and said "unknown" (tl-hus7)."""
+        resets = self.reserve_on_personal(minutes=600, remaining=27)
+        self.keeps(27, resets)
+        # A reading's reset is kept to the minute.
+        wait = "earliest reset %s (personal, weekly window)" % clock(accounts.parse_time(resets.isoformat()))
+
+        code, printed = self.swap_to("personal")
+        self.assertEqual(code, 1)
+        self.assertIn("personal is below your thresholds, " + wait, printed)
+
+        code, printed = self.invoke(grazr.swap)
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing to swap to, " + wait, printed)
+
     def test_with_no_file_only_its_own_threshold_holds(self):
         self.reserve_on_personal(minutes=600, remaining=7)
         self.assert_swapped()
@@ -3043,6 +3107,7 @@ class SwapTest(EnrolledPairFixture):
             until = datetime.now(timezone.utc) + timedelta(hours=until_hours)
             json.dump({"daily": {}, "at_reserve": {"personal": until.timestamp()}}, f)
         stamp(path, hours_ago)
+        return until
 
     def test_an_account_kept_off_refuses_a_named_swap_whatever_it_shows(self):
         """Its snapshot here is as old as this machine's last turn on it; the
@@ -3061,6 +3126,20 @@ class SwapTest(EnrolledPairFixture):
         self.assertEqual(code, 1)
         self.assertEqual(self.rotations, [])
         self.assertIn("Nothing to swap to", printed)
+
+    def test_the_key_names_when_one_kept_off_is_let_back(self):
+        """Read or not, an account kept off is free when the file says, and
+        the key said "unknown" as no window of its own was spent."""
+        for read in (True, False):
+            with self.subTest(read=read):
+                if read:
+                    self.reserve_on_personal(minutes=6000, remaining=90)
+                until = self.keep_off_personal(until_hours=2)
+
+                code, printed = self.invoke(grazr.swap)
+
+                self.assertEqual(code, 1)
+                self.assertIn("Nothing to swap to, earliest reset %s (personal, kept off)" % clock(until), printed)
 
     def test_kept_off_ends_when_it_says(self):
         self.keep_off_personal(until_hours=-0.1)
@@ -4543,6 +4622,50 @@ class KeepTest(unittest.TestCase):
                         "%s:%d sums with %s" % (module, node.lineno, word),
                     )
             self.assertNotIn("held_daily", open(os.path.join(here, module)).read())
+
+    def test_only_core_spent_says_which_windows_are_spent(self):
+        """The toast once had its own test of a spent window, held to each
+        account's floor alone, while the decision held it to what it keeps and
+        whether it is kept off too: it named the wrong account or "unknown"
+        (tl-hus7). grazr.py compares no window's remaining; core compares one
+        with a threshold only in spent."""
+        here = os.path.dirname(os.path.abspath(__file__))
+
+        def compares(module):
+            with open(os.path.join(here, module)) as source:
+                tree = ast.parse(source.read())
+            for function in ast.walk(tree):
+                if not isinstance(function, ast.FunctionDef):
+                    continue
+                for node in ast.walk(function):
+                    if not isinstance(node, ast.Compare):
+                        continue
+                    sides = [node.left] + node.comparators
+                    if any(isinstance(side, ast.Attribute) and side.attr == "remaining" for side in sides):
+                        yield function.name, node, sides
+
+        def a_threshold(side):
+            """thresholds[group], own[group] or own.get(group): one an
+            account is held to, as against a figure on record."""
+            if isinstance(side, ast.Subscript):
+                base = side.value
+            elif isinstance(side, ast.Call) and isinstance(side.func, ast.Attribute) and side.func.attr == "get":
+                base = side.func.value
+            else:
+                return False
+            return isinstance(base, ast.Name) and ("threshold" in base.id or base.id == "own")
+
+        for name, node, _ in compares("grazr.py"):
+            self.fail("grazr.py:%d (%s) compares a window's remaining: ask core.spent" % (node.lineno, name))
+        # expiring_sooner asks whether a week is worth two swaps, a margin
+        # above its threshold (a sum, so not a side here), not whether it is
+        # spent: it is what core.spent leaves fit, and never fires while
+        # RETURN_MARGIN is off.
+        below = {
+            name for name, node, sides in compares("core.py")
+            if any(a_threshold(side) for side in sides)
+        }
+        self.assertEqual(below, {"spent"})
 
     def test_one_kept_off_is_never_fit_and_never_kept(self):
         """herdtask keeps every machine off an account its readings put at its
