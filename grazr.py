@@ -23,7 +23,7 @@ import termios
 import time
 import tty
 from collections import namedtuple
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import accounts
 import atomic
@@ -85,11 +85,19 @@ RESERVE_DAILY = "RESERVE_DAILY"
 # {"<name>": unix seconds} it keeps an enrolled account off until then, whatever
 # its snapshot here shows: a tool that reads every machine knows of use since.
 # That holds however old the file is, since it ends by itself, but only up to a
-# week and a day after the file was written. With "resets": {"<name>": unix
-# seconds} it says the account's week was put back early then, by a limit reset
-# its owner used: from then the first figure of a session that has changed since
-# is the week's, whatever the record shows (see `_early_resets`).
+# week and a day after the file was written. With "put_back": {"<name>":
+# {"week": <unix seconds>, "at": <unix seconds>, "since": <unix seconds>}} it says
+# a limit reset its owner used put the account's weekly window ending `week` back
+# to full at `at`: from then the first figure of a session that has changed since
+# is the week's, whatever the record shows, unless this machine saw that window
+# put back since `since`, the same reset (see `_early_resets`). Which week a reset
+# put back, and how far apart two machines can see it, are the tool's to say:
+# grazr matches the window as told and works out neither (tl-pgvt).
 RESERVE_FILE = "reserve.json"
+# A week put back early as RESERVE_FILE tells it: `window` is its (group,
+# resets_at) key, `at` when the reset was used, `since` the earliest a put-back of
+# it seen here is the same one.
+PutBack = namedtuple("PutBack", "window at since")
 KEEP_OFF_MOST_SECONDS = 8 * 24 * 60 * 60
 _FLAG_KEYS = (("ENABLED", True), ("DRY_RUN", False))
 # A margin past half the window would rule out going back for good.
@@ -332,8 +340,8 @@ def _kept(state_dir, enrolled, now):
 def _reserve_file(state_dir, now):
     """RESERVE_FILE: what each account it names keeps this week (100, all of it,
     where it cannot be read), when each account it keeps off is free again, and
-    when each was put back early, by name. Nothing from a file that is not what
-    it should be."""
+    each week put back early (`_put_backs`), by name. Nothing from a file that is
+    not what it should be."""
     path = os.path.join(state_dir, RESERVE_FILE)
     try:
         written = os.path.getmtime(path)
@@ -343,7 +351,7 @@ def _reserve_file(state_dir, now):
         return {}, {}, {}
     if not isinstance(measured, dict):
         return {}, {}, {}
-    keep, at_reserve, resets = measured.get("keep"), measured.get("at_reserve"), measured.get("resets")
+    keep, at_reserve = measured.get("keep"), measured.get("at_reserve")
     kept = {}
     if "keep" not in measured:
         # An older tool, which left the reserve to grazr: it names under
@@ -363,12 +371,31 @@ def _reserve_file(state_dir, now):
             for name, until in (at_reserve.items() if isinstance(at_reserve, dict) else ())
             if _number(until) and written < until <= written + KEEP_OFF_MOST_SECONDS
         },
-        {
-            name: datetime.fromtimestamp(at, timezone.utc)
-            for name, at in (resets.items() if isinstance(resets, dict) else ())
-            if _number(at) and written - KEEP_OFF_MOST_SECONDS <= at <= written + 60
-        },
+        _put_backs(measured.get("put_back")),
     )
+
+
+def _put_backs(told):
+    """RESERVE_FILE's "put_back": each week put back early, by name, as a
+    PutBack, just as told. None that is not what it should be."""
+    out = {}
+    for name, back in (told.items() if isinstance(told, dict) else ()):
+        week, at, since = (back.get(key) for key in ("week", "at", "since")) if isinstance(back, dict) else (None,) * 3
+        if all(_number(value) for value in (week, at, since)) and since <= at < week:
+            out[name] = PutBack(
+                ("weekly", datetime.fromtimestamp(week, timezone.utc)),
+                datetime.fromtimestamp(at, timezone.utc),
+                datetime.fromtimestamp(since, timezone.utc),
+            )
+    return out
+
+
+def _unseen(told, key, back):
+    """Whether `told`, a PutBack, is of window `key` and a put-back this machine
+    has not seen: one `back` (`early_resets`) has of it since `told.since` is the
+    same reset."""
+    seen = back.get(key)
+    return told is not None and key == told.window and (seen is None or seen < told.since)
 
 
 def _number(value):
@@ -733,7 +760,7 @@ def _early_resets(runtime, payload, active, name, previous, limits, now):
     week may have been put back early by a limit reset. That leaves the week's
     reset time alone, so the record's lowest figure would stand until the week
     ends, and the reset would look unused. A session whose own figure rises
-    puts the week back now; RESERVE_FILE's "resets" put it back when a tool
+    puts the week back now; RESERVE_FILE's "put_back" puts it back when a tool
     that saw it says, for the first session that has changed since. Either way
     the record's figure gives way to that session's, and from then a session
     counts only once its figure has changed. Run under the readings lock."""
@@ -743,7 +770,7 @@ def _early_resets(runtime, payload, active, name, previous, limits, now):
     except (ValueError, AttributeError):
         session = None
     back = accounts.early_resets(paths, active)
-    marked = _reserve_file(state_dir, now)[2].get(name)
+    told = _reserve_file(state_dir, now)[2].get(name)
     if not session or not isinstance(session, str):
         return previous, limits
     path = os.path.join(state_dir, WEEKLY_SEEN_FILE)
@@ -759,8 +786,8 @@ def _early_resets(runtime, payload, active, name, previous, limits, now):
     rose = core.rises(before, limits, back)
     put = {key: now for key in rose}
     for key, (_, changed) in mine.items():
-        if marked and key[1] > marked and changed >= marked and back.get(key, marked - timedelta(seconds=1)) < marked:
-            put.setdefault(key, marked)
+        if _unseen(told, key, back) and changed >= told.at:
+            put.setdefault(key, told.at)
     if put:
         back.update(put)
         accounts.record_early_resets(paths, active, back, now)
@@ -790,41 +817,30 @@ def _early_resets(runtime, payload, active, name, previous, limits, now):
     return core.put_back(previous, limits, mine, back, set(put))
 
 
-# How far apart a reset's time here and herdtask's can be and still be the same
-# reset: each machine sees it at its next request, and its owner may say he used
-# it some time after he did (herdtask's riseSkew).
-RESET_SKEW = timedelta(hours=12)
-WEEK = timedelta(days=7)
-
-
 def _put_back_parked(runtime, now):
-    """A parked account whose week RESERVE_FILE's "resets" says was put back
+    """A parked account whose week RESERVE_FILE's "put_back" says was put back
     early: no session here is on it to see its figure rise, so its snapshot
     still shows the old week, spent, and refuses every move back onto it until
     the week ends. The snapshot's figure of that week becomes all of it, once,
     and `early_resets` keeps when, so a session idle since that repeats the old
     week leaves it be once the account is active again. A week this machine saw
-    put back about then already reads as it stands. The active account is its
-    sessions' to say (`_early_resets`). Run under the readings lock."""
+    put back since `PutBack.since`, the same reset, already reads as it stands.
+    The active account is its sessions' to say (`_early_resets`). Run under the
+    readings lock."""
     paths, _, state_dir, _ = runtime
-    marked = _reserve_file(state_dir, now)[2]
-    if not marked:
+    told = _reserve_file(state_dir, now)[2]
+    if not told:
         return
     active = claude.active_account(paths)
     for parked in accounts.load(paths, []):
-        at = marked.get(parked.name)
-        if not at or parked.id == active or not isinstance(parked.snapshot, list):
+        if parked.name not in told or parked.id == active or not isinstance(parked.snapshot, list):
             continue
         back = accounts.early_resets(paths, parked.id)
         put, snapshot = {}, []
         for entry in parked.snapshot:
             key = (entry.group, entry.resets_at)
-            seen = back.get(key)
-            if (
-                entry.group == "weekly" and entry.resets_at and at < entry.resets_at <= at + WEEK
-                and (seen is None or seen < at - RESET_SKEW)
-            ):
-                put[key] = at
+            if _unseen(told[parked.name], key, back):
+                put[key] = told[parked.name].at
                 entry = entry._replace(remaining=100)
             snapshot.append(entry)
         if not put:

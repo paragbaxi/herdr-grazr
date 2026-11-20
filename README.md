@@ -232,13 +232,16 @@ counts only once its figure has changed, since one idle since repeats the old
 week. The account's file keeps when, under `early_resets`, and the log says so.
 
 A tool that knows the reset was used can say so first, in Unix seconds:
-`{"resets": {"chat": 1794522600}}` in `reserve.json`. The first session on
-`chat` whose figure has changed since then puts the week back, even one that
-never saw the old week. It counts for up to a week and a day before the file
-was written. A parked account it names has no session here to show the rise, so
-its parked week reads as full from then, once, and a swap or move back onto it
-is no longer refused as below your thresholds. A week this machine saw put back
-within 12 hours of then is left as it reads.
+`{"put_back": {"chat": {"week": 1794528000, "at": 1794522600, "since": 1794479400}}}`
+in `reserve.json`. It says the weekly window ending `week` was put back at `at`,
+and a put-back of that window this machine saw since `since` is the same reset.
+The first session on `chat` whose figure has changed since `at` puts the week
+back, even one that never saw the old week. A parked account it names has no
+session here to show the rise, so its parked week reads as full from then, once,
+and a swap or move back onto it is no longer refused as below your thresholds. A
+week this machine saw put back since `since` is left as it reads. *grazr* matches
+the window as told: which week a reset was used in, and how far apart two
+machines can see the same one, are the tool's to say.
 
 ### The return margin
 
