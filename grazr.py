@@ -245,7 +245,7 @@ def act_on(decision, runtime, active_id, limits, enrolled=(), now=None):
         readings = {entry.id: entry.snapshot for entry in enrolled}
         readings[active_id] = limits
         line = "Every account is below your thresholds, earliest reset %s" % _earliest_reset(
-            now or datetime.now(timezone.utc), config, readings, enrolled
+            runtime, now or datetime.now(timezone.utc), readings, enrolled
         )
         # Keyed on the line, so a change of window earns its own announcement.
         announced = _announce_once(state_dir, line, "grazr: every account is low", line)
@@ -394,39 +394,41 @@ def _moved(decision, dry_run):
     return not dry_run and isinstance(decision, tuple) and decision[0] == "rotate"
 
 
-def _earliest_reset(now, config, readings, enrolled):
+def _earliest_reset(runtime, now, readings, enrolled):
     """When the first of these accounts could take over again, which one, and
-    the window holding it back, as a local weekday and clock time since it ends
-    up in a toast. "unknown" when no window says.
+    what holds it back, as a local weekday and clock time since it ends up in
+    a toast. "unknown" when nothing says.
 
-    Spent windows are the only ones that count, on the same terms core keeps
-    headroom. A healthy window reopening leaves every account as spent as it
-    was, so quoting its reset promises a wait that changes nothing, and a spent
-    one with no reset time keeps its account out entirely rather than let a
-    sibling window speak for it. An account is free once the last of its spent
-    windows has reset, so that one speaks for it, and the first free wins.
-    Spent means below that account's own thresholds."""
-    per_account = _per_account(config, enrolled)
+    Each account is held to what holds it in the decision, _own_thresholds:
+    its own thresholds, what RESERVE_FILE says it keeps, and whether it is
+    kept off. Only kept off is a time here, not HELD_OFF: no reading clears
+    it, but it ends when the file says. A spent window is one core.spent
+    names. A healthy window reopening leaves every account as spent as it
+    was, so quoting its reset promises a wait that changes nothing, and a
+    spent one with no reset time keeps its account out entirely rather than
+    let a sibling window speak for it. An account is free once the last of
+    what holds it has ended, so that one speaks for it, and the first free
+    wins."""
+    _, _, state_dir, config = runtime
+    held_off = _held_off(state_dir, enrolled, now)
+    per_account = _per_account(config, enrolled, _kept(state_dir, enrolled, now))
     freed = []
     for identifier, snapshot in readings.items():
-        if not isinstance(snapshot, list):
+        if not isinstance(snapshot, list) and identifier not in held_off:
+            continue  # never read here, and nothing says when it is let back
+        windows = snapshot if isinstance(snapshot, list) else []
+        spent = core.spent(windows, now, core.thresholds_of(identifier, config.thresholds, per_account))
+        if any(entry.resets_at is None for entry in spent):
             continue
-        thresholds = core.thresholds_of(identifier, config.thresholds, per_account)
-        spent = [
-            entry
-            for entry in snapshot
-            if entry.group in thresholds
-            and entry.remaining < thresholds[entry.group]
-            and (entry.resets_at is None or entry.resets_at > now)
-        ]
-        if spent and all(entry.resets_at for entry in spent):
-            freed.append(max((entry.resets_at, entry.group, identifier) for entry in spent))
+        holds = [(entry.resets_at, "%s window" % entry.group, identifier) for entry in spent]
+        if identifier in held_off:
+            holds.append((held_off[identifier], "kept off", identifier))
+        if holds:
+            freed.append(max(holds))
     if not freed:
         return "unknown"
-    when, group, identifier = min(freed)
-    return "%s (%s, %s window)" % (
-        when.astimezone().strftime("%a %H:%M"), _name_of(enrolled, identifier), group
-    )
+    when, why, identifier = min(freed)
+    return "%s (%s, %s)" % (when.astimezone().strftime("%a %H:%M"), _name_of(enrolled, identifier), why)
 
 
 def _announce_once(state_dir, key, title, body):
@@ -1353,7 +1355,7 @@ def swap(runtime=None, target=None):
                 return _refuse_swap(
                     "%s is below your thresholds, earliest reset %s"
                     % (chosen.name, _earliest_reset(
-                        now, config, {chosen.id: chosen.snapshot}, enrolled
+                        runtime, now, {chosen.id: chosen.snapshot}, enrolled
                     ))
                 )
         else:
@@ -1369,7 +1371,7 @@ def swap(runtime=None, target=None):
             }
             return _refuse_swap(
                 "Nothing to swap to, earliest reset %s"
-                % _earliest_reset(now, config, candidates, enrolled)
+                % _earliest_reset(runtime, now, candidates, enrolled)
             )
         decision = ("rotate", next_id)
         try:

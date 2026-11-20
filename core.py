@@ -257,18 +257,22 @@ def next_account(active, accounts, now, thresholds, per_account=None):
     return None
 
 
+def spent(limits, now, thresholds):
+    """The live windows below their thresholds: what keeps an account out.
+    Every judgement of spent goes through here, the decision's and the toast's
+    alike, so the two never disagree on an account."""
+    return [
+        limit
+        for limit in limits
+        if limit.group in thresholds
+        and limit.remaining < thresholds[limit.group]
+        and (limit.resets_at is None or limit.resets_at > now)
+    ]
+
+
 def shortfall(limits, now, thresholds):
     """The first live window below its threshold, or None."""
-    return next(
-        (
-            limit
-            for limit in limits
-            if limit.group in thresholds
-            and limit.remaining < thresholds[limit.group]
-            and (limit.resets_at is None or limit.resets_at > now)
-        ),
-        None,
-    )
+    return next(iter(spent(limits, now, thresholds)), None)
 
 
 def _has_headroom(limits, now, thresholds):

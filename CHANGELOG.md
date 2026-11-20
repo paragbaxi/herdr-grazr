@@ -8,6 +8,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- "Earliest reset" in the toast and the swap key's refusal now waits on what
+  the decision holds each account to: what `reserve.json` says it keeps, and
+  when one it keeps off is let back. It held each account to its own
+  thresholds alone, so an account held by what it keeps read "unknown", or a
+  sooner window of its own was named though the account stayed held. A kept
+  off account reads as `(name, kept off)`. Which windows are spent is now
+  `core.spent`'s alone, shared with the decision.
+
 - A limit reset `reserve.json` names for an account parked here now puts its
   parked week back to full, once. No session here was on it to see the rise,
   so its snapshot showed the old week spent and refused every move back onto
