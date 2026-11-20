@@ -34,10 +34,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the record kept the week's lowest figure and the week looked spent until it
   ended. A session whose own weekly figure rises ten points or more puts the
   week back; from then a session counts only once its figure has changed, as
-  an idle one repeats the old week. `"resets": {"<name>": <unix seconds>}` in
-  `reserve.json`, from a tool that knows the reset was used, puts the week back
-  for the first session to change since. The account file keeps when, under
-  `early_resets`, and the log says so.
+  an idle one repeats the old week. `"put_back": {"<name>": {"week": …, "at":
+  …, "since": …}}` in `reserve.json`, from a tool that knows the reset was used,
+  puts that window back for the first session to change since `at`, unless this
+  machine saw it put back since `since`. grazr matches the window as told and
+  works out neither the week nor the bound itself. The account file keeps when,
+  under `early_resets`, and the log says so.
 
 - `REMAINING_SESSION_<name>` and `REMAINING_WEEKLY_<name>` give one account
   thresholds of its own, such as a reserve on an account you also chat on.

@@ -3964,13 +3964,26 @@ class EarlyResetTest(EnrolledPairFixture):
         with open(path, "w") as handle:
             json.dump(book, handle)
 
-    def mark(self, when):
-        """reserve.json, written a minute after the week was put back."""
+    def mark(self, when, week=None):
+        """reserve.json, written a minute after the week was put back, as the
+        tool tells it: the week, when, and since when a put-back of it seen here
+        is that one."""
         path = os.path.join(self.state_dir, "reserve.json")
         with open(path, "w") as handle:
-            json.dump({"resets": {"work": int(when.timestamp())}}, handle)
+            json.dump({"put_back": {"work": {
+                "week": week or self.week_ends, "at": int(when.timestamp()),
+                "since": int((when - timedelta(hours=12)).timestamp()),
+            }}}, handle)
         written = (when + timedelta(minutes=1)).timestamp()
         os.utime(path, (written, written))
+
+    def age_early_resets(self, hours):
+        """As if this machine saw each put-back that long ago."""
+        stored = self.stored()
+        for entry in stored["early_resets"]:
+            entry["at"] = (datetime.fromisoformat(entry["at"]) - timedelta(hours=hours)).isoformat()
+        with open(os.path.join(self.state_dir, "accounts", "uuid-work.json"), "w") as handle:
+            json.dump(stored, handle)
 
     def test_a_session_whose_own_figure_rises_puts_the_week_back(self):
         self.show("busy", 99)
@@ -4025,6 +4038,31 @@ class EarlyResetTest(EnrolledPairFixture):
         self.show("other", 1)  # since the mark too, but the week is put back once
         self.assertEqual(self.left(), [97])
 
+    def test_a_put_back_seen_here_since_the_tools_bound_is_that_one(self):
+        """A session here saw the week rise two hours before the tool says the
+        reset was used: within what the tool calls the same reset, so it is not
+        put back a second time, and what was spent since stands."""
+        self.show("busy", 99)
+        self.show("busy", 0)
+        self.age_early_resets(2)
+        self.show("busy", 4)
+        self.mark(datetime.now(timezone.utc) - timedelta(minutes=1))
+
+        self.show("new", 3)
+
+        self.assertEqual(self.left(), [96])
+
+    def test_a_mark_of_another_week_puts_nothing_back(self):
+        """The tool names the week its reset put back; grazr matches no other."""
+        self.show("gone", 99)
+        self.age_book(10)
+        self.mark(datetime.now(timezone.utc) - timedelta(minutes=1), week=self.week_ends + 7 * 24 * 60 * 60)
+
+        self.show("new", 3)
+
+        self.assertEqual(self.left(), [1])
+        self.assertNotIn("early_resets", self.stored())
+
     def test_a_payload_with_no_session_counts_as_before(self):
         for used in (99, 0):
             payload = json.dumps({"rate_limits": {"seven_day": {"used_percentage": used, "resets_at": self.week_ends}}})
@@ -4045,7 +4083,7 @@ class EarlyResetTest(EnrolledPairFixture):
 
 class ParkedResetTest(EnrolledPairFixture):
     """A limit reset used on an account no machine here is on: no session can
-    see it rise, so only RESERVE_FILE's "resets" says so. Its parked snapshot
+    see it rise, so only RESERVE_FILE's "put_back" says so. Its parked snapshot
     still shows the old week spent, which would refuse every move back onto it
     until the week ends (herdtask, 2026-11-19: the fleet moved off spent qa, he
     used qa's reset, and nothing could come back to it)."""
@@ -4054,7 +4092,8 @@ class ParkedResetTest(EnrolledPairFixture):
         super().setUp()
         self.write_config('REMAINING_WEEKLY=10\nACCOUNTS="work personal"\n')
         now = datetime.now(timezone.utc)
-        self.week_ends = (now + timedelta(days=3)).replace(microsecond=0)
+        # A whole minute, as grazr keeps a window's end and so as the tool names it.
+        self.week_ends = (now + timedelta(days=3)).replace(second=0, microsecond=0)
         self.park("uuid-personal", "personal", 1)
 
     def park(self, identifier, name, remaining, early_resets=None):
@@ -4070,11 +4109,14 @@ class ParkedResetTest(EnrolledPairFixture):
         with open(path, "w") as f:
             json.dump(stored, f)
 
-    def mark(self, name, when):
+    def mark(self, name, when, week=None):
         """reserve.json as herdtask writes it, a minute after the reset was used."""
         path = os.path.join(self.state_dir, grazr.RESERVE_FILE)
         with open(path, "w") as f:
-            json.dump({"keep": {}, "at_reserve": {}, "resets": {name: int(when.timestamp())}}, f)
+            json.dump({"keep": {}, "at_reserve": {}, "put_back": {name: {
+                "week": int((week or self.week_ends).timestamp()), "at": int(when.timestamp()),
+                "since": int((when - timedelta(hours=12)).timestamp()),
+            }}}, f)
         written = (when + timedelta(minutes=1)).timestamp()
         os.utime(path, (written, written))
 
@@ -4123,6 +4165,12 @@ class ParkedResetTest(EnrolledPairFixture):
 
         self.assertEqual(code, 0)
         self.assertEqual(self.left(), [60])
+
+    def test_only_the_week_told_is_put_back(self):
+        self.mark("personal", datetime.now(timezone.utc) - timedelta(minutes=1), week=self.week_ends + timedelta(days=7))
+        code, _ = self.swap_to("personal")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.left(), [1])
 
     def test_only_the_account_the_reset_was_used_on_is_put_back(self):
         self.mark("other", datetime.now(timezone.utc) - timedelta(minutes=1))
@@ -4667,6 +4715,38 @@ class KeepTest(unittest.TestCase):
         }
         self.assertEqual(below, {"spent"})
 
+    def test_grazr_matches_no_reset_to_a_week_itself(self):
+        """Which week a limit reset put back, and how far apart two machines can
+        see the same one, are the other tool's to say (RESERVE_FILE's
+        "put_back", tl-pgvt): a second copy here once held its 12 hours and its
+        week. What applies its word sums no times, and no module keeps a span of
+        time of its own: grazr's times come from Claude and from the tool."""
+        def sums(tree):
+            return [node.lineno for node in ast.walk(tree) if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub))]
+
+        def spans(tree):
+            return [
+                node.lineno for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", None)) == "timedelta"
+            ]
+
+        old = ast.parse(
+            "RESET_SKEW = timedelta(hours=12)\n"
+            "if at < entry.resets_at <= at + WEEK and (seen is None or seen < at - RESET_SKEW):\n    pass\n"
+        )
+        self.assertTrue(sums(old) and spans(old), "the check no longer sees the copy it replaced")
+        here = os.path.dirname(os.path.abspath(__file__))
+        applying = {"_put_backs", "_unseen", "_early_resets", "_put_back_parked"}
+        for module in ("core.py", "grazr.py", "accounts.py"):
+            with open(os.path.join(here, module)) as source:
+                tree = ast.parse(source.read())
+            self.assertEqual(spans(tree), [], "%s keeps a span of time: take the tool's" % module)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name in applying:
+                    applying.discard(node.name)
+                    self.assertEqual(sums(node), [], "%s:%s sums times: take the tool's put_back as told" % (module, node.name))
+        self.assertEqual(applying, set(), "gone: is the check still looking at what applies put_back?")
+
     def test_one_kept_off_is_never_fit_and_never_kept(self):
         """herdtask keeps every machine off an account its readings put at its
         reserve, read or not (T-467)."""
@@ -4697,8 +4777,16 @@ class KeepTest(unittest.TestCase):
                 },
                 "daily": {"older": 7.8},
                 "at_reserve": {"chat": 1794528000, "bad": "soon", "worse": True},
-                # chat's week put back an hour before, work's 9 days before: too old.
-                "resets": {"chat": 1794522600, "work": 1793748600, "bad": "now"},
+                # chat's week put back an hour before; none of the rest reads.
+                "put_back": {
+                    "chat": {"week": 1794528000, "at": 1794522600, "since": 1794479400},
+                    "bad": {"week": 1794528000, "at": "now", "since": 1794479400},
+                    "late": {"week": 1794522600, "at": 1794522600, "since": 1794479400},
+                    "loose": {"week": 1794528000, "at": 1794522600, "since": 1794522601},
+                    "worst": 1794522600,
+                },
+                # As an older tool told it: when alone, which grazr no longer matches to a week.
+                "resets": {"work": 1794522600},
             }, f)
         written = datetime(2026, 11, 12, 23, 30, tzinfo=timezone.utc)
         os.utime(path, (written.timestamp(), written.timestamp()))
@@ -4706,7 +4794,9 @@ class KeepTest(unittest.TestCase):
         kept, until, put_back = grazr._reserve_file(directory, written)
         self.assertEqual(kept, {"chat": 27, "bad": 100, "worse": 100, "worst": 100})
         self.assertEqual(until, {"chat": reset})
-        self.assertEqual(put_back, {"chat": written - timedelta(hours=1)})
+        self.assertEqual(put_back, {"chat": grazr.PutBack(
+            ("weekly", reset), written - timedelta(hours=1), written - timedelta(hours=13),
+        )})
         chat = core.Account("id-chat", "chat", None)
         self.assertEqual(grazr._held_off(directory, [chat], reset - timedelta(minutes=1)), {"id-chat": reset})
         self.assertEqual(grazr._held_off(directory, [chat], reset), {})
