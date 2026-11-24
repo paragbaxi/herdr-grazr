@@ -98,19 +98,34 @@ def rises(mine, current, back):
     }
 
 
-def put_back(previous, current, mine, back, rose):
+def fell(before, mine, key, since):
+    """Whether a session's figure of window `key` fell from one it showed before
+    `since`, when the week was put back: then it is still the old week's. A
+    session stopped at its usage limit and sent on after the reset first shows
+    the old week's last figure, spent, and only its next request reads the week
+    put back. `before` and `mine` as `seen` keeps them, before and after this
+    payload."""
+    return key in before and key in mine and before[key][1] < since and mine[key][0] < before[key][0]
+
+
+def put_back(previous, current, mine, back, rose, before=None):
     """`previous` and `current` as `merged` takes them once a week was put back
     early. `back` maps each such window, (group, resets_at), to when; `rose` is
     those this payload puts back, whose record no longer counts. A figure of a
     window put back counts only if the session's figure changed since, in
-    `mine` as `seen` keeps it: a session idle since repeats the old week, and
-    the record stands. A payload no session is known for counts, as before."""
+    `mine` as `seen` keeps it, and did not fall from one it showed before (see
+    `fell`, with `before` the session's figures before this payload): a session
+    idle since repeats the old week, and the record stands. A payload no
+    session is known for counts, as before."""
+    before = before or {}
     if isinstance(previous, list):
         previous = [entry for entry in previous if (entry.group, entry.resets_at) not in rose]
     kept = []
     for entry in current:
         key = (entry.group, entry.resets_at)
-        if key in back and key not in rose and key in mine and mine[key][1] < back[key]:
+        if key in back and key not in rose and key in mine and (
+            mine[key][1] < back[key] or fell(before, mine, key, back[key])
+        ):
             continue
         kept.append(entry)
     return previous, kept
