@@ -763,7 +763,9 @@ def _early_resets(runtime, payload, active, name, previous, limits, now):
     puts the week back now; RESERVE_FILE's "put_back" puts it back when a tool
     that saw it says, for the first session that has changed since. Either way
     the record's figure gives way to that session's, and from then a session
-    counts only once its figure has changed. Run under the readings lock."""
+    counts only once its figure has changed, and not when it fell from one it
+    showed before the put-back (`core.fell`: a session sent on after its stop
+    at Claude's limit shows the old week once). Run under the readings lock."""
     paths, _, state_dir, _ = runtime
     try:
         session = json.loads(payload).get("session_id")
@@ -786,7 +788,7 @@ def _early_resets(runtime, payload, active, name, previous, limits, now):
     rose = core.rises(before, limits, back)
     put = {key: now for key in rose}
     for key, (_, changed) in mine.items():
-        if _unseen(told, key, back) and changed >= told.at:
+        if _unseen(told, key, back) and changed >= told.at and not core.fell(before, mine, key, told.at):
             put.setdefault(key, told.at)
     if put:
         back.update(put)
@@ -814,7 +816,7 @@ def _early_resets(runtime, payload, active, name, previous, limits, now):
             atomic.write(path, json.dumps(book))
         except OSError:
             pass
-    return core.put_back(previous, limits, mine, back, set(put))
+    return core.put_back(previous, limits, mine, back, set(put), before)
 
 
 def _put_back_parked(runtime, now):

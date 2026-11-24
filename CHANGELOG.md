@@ -8,6 +8,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A session stopped at the weekly limit and sent on after a limit reset no
+  longer reads the week put back as spent. Its first figure since is the old
+  week's last one, spent, and *grazr* took it as the new week's: for up to a
+  minute the account read 0% left, enough to move off the account just reset.
+  A session's figure that falls from one it showed before the reset is now the
+  old week's, whether a session here saw the rise or `reserve.json` told of
+  it; its next request reads the week as it is (`core.fell`).
+
 - "Earliest reset" in the toast and the swap key's refusal now waits on what
   the decision holds each account to: what `reserve.json` says it keeps, and
   when one it keeps off is let back. It held each account to its own

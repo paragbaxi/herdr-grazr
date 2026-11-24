@@ -4032,6 +4032,38 @@ class EarlyResetTest(EnrolledPairFixture):
         self.show("new", 5)
         self.assertEqual(self.left(), [95])
 
+    def test_a_session_sent_on_after_the_reset_shows_the_old_week_once(self):
+        """A session stopped at Claude's limit and sent on after the reset first
+        shows the old week's last figure, spent, then its next request reads the
+        week put back. That spent figure is the old week's: it never stands as
+        the week put back, which would read empty and move the machine off it
+        (2026-11-23: every machine sent on read 0% for up to a minute)."""
+        self.show("stopped", 99)
+        self.show("busy", 99)
+        self.age_book(60)
+        self.show("busy", 1)  # its next request, after the reset
+        self.assertEqual(self.left(), [99])
+
+        self.show("stopped", 100)  # sent on: Claude's stop, shown at last
+        self.assertEqual(self.left(), [99])
+        self.show("stopped", 2)  # its first request since
+        self.assertEqual(self.left(), [98])
+
+    def test_a_session_sent_on_after_a_told_reset_shows_the_old_week_once(self):
+        """The same with no session here on the account when the reset was
+        used: the tool's word puts the week back for the first session read
+        since, but not at the old week's spent figure."""
+        self.show("stopped", 99)
+        self.age_book(60)
+        self.mark(datetime.now(timezone.utc) - timedelta(minutes=12))
+
+        self.show("stopped", 100)  # sent on: Claude's stop, shown at last
+        self.assertNotIn("early_resets", self.stored())
+        self.show("stopped", 2)  # its first request since
+
+        self.assertEqual(self.left(), [98])
+        self.assertEqual([entry["group"] for entry in self.stored()["early_resets"]], ["weekly"])
+
     def test_a_mark_counts_once(self):
         self.mark(datetime.now(timezone.utc) - timedelta(minutes=1))
         self.show("new", 3)
